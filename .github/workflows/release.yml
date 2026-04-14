@@ -26,20 +26,9 @@ jobs:
       - name: Test
         run: go test -race ./...
 
-  build-binaries:
+  release:
     needs: test
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -47,25 +36,16 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
+      - name: Build binaries
         run: |
-          go build -ldflags="-s -w" -o fcgi-proxy-${{ matrix.goos }}-${{ matrix.goarch }} .
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: fcgi-proxy-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: fcgi-proxy-${{ matrix.goos }}-${{ matrix.goarch }}
-
-  docker:
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -ldflags="-s -w" -o "dist/fcgi-proxy-${os}-${arch}" .
+          done
+          ls -la dist/
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -91,7 +71,7 @@ jobs:
             type=semver,pattern={{major}}
             type=sha
 
-      - name: Build and push
+      - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -102,23 +82,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  release:
-    needs: [build-binaries, docker]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: List artifacts
-        run: ls -la artifacts/
-
-      - name: Create release
+      - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: artifacts/fcgi-proxy-*
+          files: dist/fcgi-proxy-*
