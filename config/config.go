@@ -22,6 +22,8 @@ type Config struct {
 	WriteTimeout   string `json:"write_timeout"`
 	MaxBodySize     int               `json:"max_body_size"`
 	MaxConcurrency  int               `json:"max_concurrency"`
+	PoolMaxIdle     int               `json:"pool_max_idle"`
+	PoolIdleTimeout string            `json:"pool_idle_timeout"`
 	ResponseHeaders map[string]string `json:"response_headers"`
 	Locations       []LocationConfig  `json:"locations"`
 }
@@ -52,6 +54,8 @@ type Parsed struct {
 	WriteTimeout   time.Duration
 	MaxBodySize     int
 	MaxConcurrency  int
+	PoolMaxIdle     int
+	PoolIdleTimeout time.Duration
 	ResponseHeaders map[string]string
 	Locations       []ParsedLocation
 }
@@ -82,8 +86,10 @@ func DefaultConfig() Config {
 		DialTimeout:    "5s",
 		ReadTimeout:    "30s",
 		WriteTimeout:   "30s",
-		MaxBodySize:    10 * 1024 * 1024, // 10 MB
-		MaxConcurrency: 1024,
+		MaxBodySize:     10 * 1024 * 1024, // 10 MB
+		MaxConcurrency:  1024,
+		PoolMaxIdle:     16,
+		PoolIdleTimeout: "30s",
 	}
 }
 
@@ -194,6 +200,17 @@ func Parse(cfg Config) (Parsed, error) {
 		return Parsed{}, fmt.Errorf("config: max_concurrency must be between 1 and %d, got %d", maxAllowedConcurrency, cfg.MaxConcurrency)
 	}
 
+	if cfg.PoolMaxIdle <= 0 || cfg.PoolMaxIdle > 1024 {
+		return Parsed{}, fmt.Errorf("config: pool_max_idle must be between 1 and 1024, got %d", cfg.PoolMaxIdle)
+	}
+	poolIdleTimeout, err := time.ParseDuration(cfg.PoolIdleTimeout)
+	if err != nil {
+		return Parsed{}, fmt.Errorf("config: invalid pool_idle_timeout %q: %w", cfg.PoolIdleTimeout, err)
+	}
+	if poolIdleTimeout < time.Second || poolIdleTimeout > maxTimeout {
+		return Parsed{}, fmt.Errorf("config: pool_idle_timeout must be between 1s and %v, got %v", maxTimeout, poolIdleTimeout)
+	}
+
 	return Parsed{
 		Listen:         cfg.Listen,
 		Network:        cfg.Network,
@@ -205,6 +222,8 @@ func Parse(cfg Config) (Parsed, error) {
 		WriteTimeout:   writeTimeout,
 		MaxBodySize:     cfg.MaxBodySize,
 		MaxConcurrency:  cfg.MaxConcurrency,
+		PoolMaxIdle:     cfg.PoolMaxIdle,
+		PoolIdleTimeout: poolIdleTimeout,
 		ResponseHeaders: cfg.ResponseHeaders,
 		Locations:       parsedLocations,
 	}, nil

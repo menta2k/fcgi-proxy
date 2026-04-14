@@ -32,18 +32,28 @@ type ClientConfig struct {
 	DialTimeout  time.Duration
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
+	Pool         PoolConfig
 }
 
 // Client is a FastCGI client that communicates with an upstream server.
-// Each call to Do opens a new connection to the upstream. The Client is
-// safe for concurrent use — it holds only immutable configuration.
+// It maintains a connection pool for reuse across requests.
+// Safe for concurrent use.
 type Client struct {
-	cfg ClientConfig
+	cfg  ClientConfig
+	pool *ConnPool
 }
 
-// NewClient creates a new FastCGI client.
+// NewClient creates a new FastCGI client with a connection pool.
 func NewClient(cfg ClientConfig) *Client {
-	return &Client{cfg: cfg}
+	return &Client{
+		cfg:  cfg,
+		pool: NewConnPool(cfg.Network, cfg.Address, cfg.DialTimeout, cfg.Pool),
+	}
+}
+
+// Close shuts down the client and its connection pool.
+func (c *Client) Close() {
+	c.pool.Close()
 }
 
 // Request represents a FastCGI request to send upstream.
@@ -53,46 +63,52 @@ type Request struct {
 }
 
 // Do sends a FastCGI request and returns the response.
+// Connections are reused from the pool when available.
 func (c *Client) Do(req Request) (Response, error) {
-	conn, err := net.DialTimeout(c.cfg.Network, c.cfg.Address, c.cfg.DialTimeout)
+	conn, err := c.pool.Get()
 	if err != nil {
 		return Response{}, fmt.Errorf("fcgi: connect: %w", err)
 	}
-	defer conn.Close()
 
 	const requestID uint16 = 1
 
 	if err := conn.SetWriteDeadline(time.Now().Add(c.cfg.WriteTimeout)); err != nil {
+		conn.Close()
 		return Response{}, fmt.Errorf("fcgi: set write deadline: %w", err)
 	}
 
 	if err := c.writeRequest(conn, requestID, req); err != nil {
+		conn.Close()
 		return Response{}, fmt.Errorf("fcgi: write request: %w", err)
 	}
 
 	if err := conn.SetReadDeadline(time.Now().Add(c.cfg.ReadTimeout)); err != nil {
+		conn.Close()
 		return Response{}, fmt.Errorf("fcgi: set read deadline: %w", err)
 	}
 
 	resp, err := c.readResponse(conn, requestID)
 	if err != nil {
 		// Best-effort abort so the upstream can clean up gracefully.
-		// Reset deadline since the read deadline may have already expired.
 		_ = conn.SetDeadline(time.Now().Add(time.Second))
 		_ = WriteRecord(conn, TypeAbortRequest, requestID, nil)
+		conn.Close()
 		return Response{}, fmt.Errorf("fcgi: read response: %w", err)
 	}
+
+	// Success — return the connection to the pool for reuse.
+	c.pool.Put(conn)
 
 	return resp, nil
 }
 
 func (c *Client) writeRequest(conn net.Conn, requestID uint16, req Request) error {
-	// Pool the bufio.Writer to avoid allocating 4 KB per request.
 	w := bufioWriterPool.Get().(*bufio.Writer)
 	w.Reset(conn)
 	defer bufioWriterPool.Put(w)
 
-	if err := WriteBeginRequest(w, requestID, RoleResponder, false); err != nil {
+	// keepConn=true tells PHP-FPM to keep the connection open after this request.
+	if err := WriteBeginRequest(w, requestID, RoleResponder, true); err != nil {
 		return err
 	}
 
@@ -132,7 +148,6 @@ func writeStream(w io.Writer, recType uint8, requestID uint16, data []byte) erro
 }
 
 // writeStreamFromReader streams data from a reader as FastCGI records.
-// Uses a pooled buffer to avoid allocating 64 KB per request.
 func writeStreamFromReader(w io.Writer, recType uint8, requestID uint16, r io.Reader) error {
 	poolBuf := stdinBufPool.Get().(*[]byte)
 	buf := *poolBuf
@@ -155,10 +170,7 @@ func writeStreamFromReader(w io.Writer, recType uint8, requestID uint16, r io.Re
 }
 
 func (c *Client) readResponse(conn net.Conn, requestID uint16) (Response, error) {
-	// Pool stdout and stderr buffers.
-	// Discard oversized buffers to prevent the pool from retaining
-	// the high-water mark of the largest response ever seen.
-	const maxPooledBufCap = 1 * 1024 * 1024 // 1 MB
+	const maxPooledBufCap = 1 * 1024 * 1024
 
 	stdout := stdoutBufPool.Get().(*bytes.Buffer)
 	stdout.Reset()
@@ -204,7 +216,6 @@ func (c *Client) readResponse(conn net.Conn, requestID uint16) (Response, error)
 			if len(rec.Content) >= 5 && rec.Content[4] != StatusRequestComplete {
 				return Response{}, fmt.Errorf("fcgi: upstream refused request (protocol status %d)", rec.Content[4])
 			}
-			// Copy stdout/stderr bytes out before returning buffers to pool.
 			stdoutBytes := make([]byte, stdout.Len())
 			copy(stdoutBytes, stdout.Bytes())
 			stderrBytes := make([]byte, stderr.Len())
@@ -215,8 +226,6 @@ func (c *Client) readResponse(conn net.Conn, requestID uint16) (Response, error)
 }
 
 // parseHTTPResponse parses the CGI/FastCGI response (headers + body).
-// Uses net/textproto.Reader for robust MIME header parsing that handles
-// both \r\n and \n line endings, continuation lines, and EOF correctly.
 func parseHTTPResponse(stdout, stderr []byte) (Response, error) {
 	resp := Response{
 		StatusCode: 200,
@@ -228,7 +237,6 @@ func parseHTTPResponse(stdout, stderr []byte) (Response, error) {
 		return resp, nil
 	}
 
-	// Pool the bufio.Reader.
 	reader := bufioReaderPool.Get().(*bufio.Reader)
 	reader.Reset(bytes.NewReader(stdout))
 	defer bufioReaderPool.Put(reader)
@@ -241,7 +249,6 @@ func parseHTTPResponse(stdout, stderr []byte) (Response, error) {
 		return resp, nil
 	}
 
-	// Extract Status pseudo-header.
 	if status := mimeHeader.Get("Status"); status != "" {
 		if len(status) >= 3 {
 			if code, parseErr := strconv.Atoi(status[:3]); parseErr == nil && code >= 100 && code < 600 {
@@ -251,12 +258,10 @@ func parseHTTPResponse(stdout, stderr []byte) (Response, error) {
 		mimeHeader.Del("Status")
 	}
 
-	// Use the textproto.MIMEHeader directly as our header map to avoid copying.
 	// Safe: textproto allocates its own strings from the wire bytes — the map and
 	// its []string values are fully independent of the pooled bufio.Reader.
 	resp.Headers = map[string][]string(mimeHeader)
 
-	// Everything after the header block is the body.
 	body, readErr := io.ReadAll(reader)
 	if readErr != nil {
 		return Response{}, fmt.Errorf("fcgi: read body: %w", readErr)

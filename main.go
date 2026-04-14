@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/sko/fcgi-proxy/config"
+	"github.com/sko/fcgi-proxy/fcgi"
 	"github.com/sko/fcgi-proxy/proxy"
 	"github.com/sko/fcgi-proxy/proxy/locationcache"
 	"github.com/valyala/fasthttp"
@@ -68,6 +69,10 @@ func main() {
 		WriteTimeout:    parsed.WriteTimeout,
 		ResponseHeaders: parsed.ResponseHeaders,
 		Locations:       locations,
+		Pool: fcgi.PoolConfig{
+			MaxIdle:     parsed.PoolMaxIdle,
+			IdleTimeout: parsed.PoolIdleTimeout,
+		},
 	})
 
 	server := &fasthttp.Server{
