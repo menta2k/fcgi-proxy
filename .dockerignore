@@ -1,0 +1,10 @@
+.git
+.gitignore
+*.md
+Dockerfile
+.dockerignore
+config.json
+config.local.json
+config.example.json
+cover.out
+fcgi-proxy

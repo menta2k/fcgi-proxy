@@ -1,0 +1,58 @@
+replicaCount: 1
+
+phpFpm:
+  image:
+    repository: php
+    tag: "8.3-fpm-alpine"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+proxy:
+  image:
+    repository: fcgi-proxy
+    tag: latest
+    pullPolicy: IfNotPresent
+  port: 8080
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 64Mi
+
+config:
+  listen: ":8080"
+  network: "tcp"
+  address: "127.0.0.1:9000"
+  documentRoot: "/var/www/html"
+  index: "index.php"
+  dialTimeout: "5s"
+  readTimeout: "30s"
+  writeTimeout: "30s"
+  maxBodySize: 10485760
+  maxConcurrency: 1024
+  responseHeaders:
+    X-Content-Type-Options: nosniff
+    X-Frame-Options: DENY
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: php-app.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []

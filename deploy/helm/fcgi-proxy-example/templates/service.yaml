@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "fcgi-proxy-example.fullname" . }}
+  labels:
+    {{- include "fcgi-proxy-example.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "fcgi-proxy-example.selectorLabels" . | nindent 4 }}
