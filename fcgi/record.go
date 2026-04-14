@@ -1,6 +1,7 @@
 package fcgi
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -66,21 +67,9 @@ type Record struct {
 // ReadRecord reads a single FastCGI record from the reader.
 // The returned Content slice is a copy owned by the caller.
 func ReadRecord(r io.Reader) (Record, error) {
-	var buf [headerSize]byte
-	if _, err := io.ReadFull(r, buf[:]); err != nil {
+	h, err := readHeader(r)
+	if err != nil {
 		return Record{}, err
-	}
-
-	h := Header{
-		Version:       buf[0],
-		Type:          buf[1],
-		RequestID:     binary.BigEndian.Uint16(buf[2:4]),
-		ContentLength: binary.BigEndian.Uint16(buf[4:6]),
-		PaddingLength: buf[6],
-	}
-
-	if h.Version != version {
-		return Record{}, ErrInvalidHeader
 	}
 
 	totalLen := int(h.ContentLength) + int(h.PaddingLength)
@@ -97,7 +86,6 @@ func ReadRecord(r io.Reader) (Record, error) {
 		return Record{}, err
 	}
 
-	// Copy content so the caller owns it and we can return the pool buffer.
 	content := make([]byte, h.ContentLength)
 	copy(content, readBuf[:h.ContentLength])
 	recordBufPool.Put(poolBuf)
@@ -106,6 +94,108 @@ func ReadRecord(r io.Reader) (Record, error) {
 		Header:  h,
 		Content: content,
 	}, nil
+}
+
+// ReadRecordInto reads a FastCGI record and appends stdout/stderr content
+// directly into the provided buffer, eliminating intermediate copies.
+// Returns the header and the number of content bytes appended.
+// For non-stdout/stderr records, content is returned in the Record.Content field.
+func ReadRecordInto(r io.Reader, stdout, stderr *bytes.Buffer, maxStdout, maxStderr int) (Record, error) {
+	h, err := readHeader(r)
+	if err != nil {
+		return Record{}, err
+	}
+
+	totalLen := int(h.ContentLength) + int(h.PaddingLength)
+	if totalLen == 0 {
+		return Record{Header: h}, nil
+	}
+
+	// For stdout/stderr, read directly into the target buffer to avoid copies.
+	if h.Type == TypeStdout || h.Type == TypeStderr {
+		var target *bytes.Buffer
+		var maxSize int
+		if h.Type == TypeStdout {
+			target = stdout
+			maxSize = maxStdout
+		} else {
+			target = stderr
+			maxSize = maxStderr
+		}
+
+		contentLen := int(h.ContentLength)
+
+		if target.Len()+contentLen > maxSize {
+			// Would exceed cap — skip by reading into pool buffer and discarding.
+			poolBuf := recordBufPool.Get().(*[]byte)
+			_, err := io.ReadFull(r, (*poolBuf)[:totalLen])
+			recordBufPool.Put(poolBuf)
+			if err != nil {
+				return Record{}, err
+			}
+			if h.Type == TypeStdout {
+				return Record{}, errors.New("fcgi: response body exceeds size limit")
+			}
+			// Stderr overflow is silently truncated.
+			return Record{Header: h}, nil
+		}
+
+		// Grow the buffer, read content directly into its tail.
+		target.Grow(contentLen)
+		buf := target.AvailableBuffer()[:contentLen]
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return Record{}, err
+		}
+		target.Write(buf)
+
+		// Discard padding.
+		paddingLen := int(h.PaddingLength)
+		if paddingLen > 0 {
+			var padBuf [recordAlignment - 1]byte
+			if _, err := io.ReadFull(r, padBuf[:paddingLen]); err != nil {
+				return Record{}, err
+			}
+		}
+
+		return Record{Header: h}, nil
+	}
+
+	// For other record types (BeginRequest, EndRequest, Params, etc.),
+	// read content normally.
+	poolBuf := recordBufPool.Get().(*[]byte)
+	readBuf := (*poolBuf)[:totalLen]
+
+	if _, err := io.ReadFull(r, readBuf); err != nil {
+		recordBufPool.Put(poolBuf)
+		return Record{}, err
+	}
+
+	content := make([]byte, h.ContentLength)
+	copy(content, readBuf[:h.ContentLength])
+	recordBufPool.Put(poolBuf)
+
+	return Record{Header: h, Content: content}, nil
+}
+
+func readHeader(r io.Reader) (Header, error) {
+	var buf [headerSize]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return Header{}, err
+	}
+
+	h := Header{
+		Version:       buf[0],
+		Type:          buf[1],
+		RequestID:     binary.BigEndian.Uint16(buf[2:4]),
+		ContentLength: binary.BigEndian.Uint16(buf[4:6]),
+		PaddingLength: buf[6],
+	}
+
+	if h.Version != version {
+		return Header{}, ErrInvalidHeader
+	}
+
+	return h, nil
 }
 
 // WriteRecord writes a FastCGI record to the writer.

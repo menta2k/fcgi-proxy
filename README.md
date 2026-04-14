@@ -128,6 +128,8 @@ Copy `config.example.json` to `config.json` and edit as needed.
 | Write timeout | `write_timeout` | - | `30s` | Timeout for writing to the upstream; also HTTP server write timeout |
 | Max body size | `max_body_size` | - | `10485760` (10 MB) | Maximum request body in bytes (1 to 268435456) |
 | Max concurrency | `max_concurrency` | - | `1024` | Maximum simultaneous connections (1 to 65535) |
+| Pool max idle | `pool_max_idle` | - | `32` | Maximum idle connections kept in the FastCGI connection pool (1 to 1024) |
+| Pool idle timeout | `pool_idle_timeout` | - | `30s` | How long an idle connection can sit unused before being closed (1s to 5m) |
 | Response headers | `response_headers` | - | `{}` | Map of headers added to every response (see below) |
 | Locations | `locations` | - | `[]` | External proxy locations with caching (see below) |
 
@@ -207,6 +209,8 @@ At startup, the proxy validates:
 - All timeouts are valid durations within bounds
 - `max_body_size` is between 1 and 256 MB
 - `max_concurrency` is between 1 and 65535
+- `pool_max_idle` is between 1 and 1024
+- `pool_idle_timeout` is between 1s and 5m
 - `response_headers` keys are alphanumeric/hyphens; values have no CR/LF/null
 - `locations` paths start with `/`; upstreams are `http://` or `https://` without credentials; TTLs are non-negative; maximum 100 locations
 
@@ -218,29 +222,77 @@ Invalid configuration causes the proxy to exit with a clear error message.
 
 ## Performance
 
-The proxy is optimized for minimal memory allocations per request:
+### Connection pooling
+
+The proxy maintains a pool of reusable TCP/Unix connections to PHP-FPM, eliminating the TCP handshake overhead on every request:
+
+- **LIFO ordering** — most recently used connection returned first (most likely alive)
+- **No liveness probe** — dead connections are detected on write and discarded (eliminates 3 syscalls per reuse)
+- **`keepConn=true`** — tells PHP-FPM to keep connections open after each request
+- **Background eviction** — idle connections are cleaned up automatically
+- **Configurable** — `pool_max_idle` (default 32) and `pool_idle_timeout` (default 30s)
+
+For best results, set `pool_max_idle` to match or exceed your PHP-FPM `pm.max_children`.
+
+### Memory optimizations
 
 - **Pooled buffers** — `bufio.Writer`, `bufio.Reader`, `bytes.Buffer` (stdout/stderr), record content buffers, and stdin streaming buffers are all reused via `sync.Pool`
-- **Oversized buffer eviction** — pooled `bytes.Buffer` instances larger than 1 MB are discarded instead of returned to the pool, preventing the pool from permanently holding the high-water mark of the largest response
+- **Direct buffer writes** — `ReadRecordInto` appends FastCGI stdout/stderr content directly into the response buffer, eliminating per-record intermediate copies
+- **Oversized buffer eviction** — pooled `bytes.Buffer` instances larger than 1 MB are discarded instead of returned to the pool, preventing high-water-mark retention
 - **Zero-allocation header processing** — blocked-header checks and CGI env key construction use fixed-size stack buffers with no heap allocations
 - **Pre-sized maps** — CGI params map pre-allocated to 28 entries; response headers map pre-allocated to 8 entries
 - **Pre-estimated encoding buffer** — `EncodeParams` estimates total byte count upfront, reducing append-growth from ~5 allocations to 1
 - **Direct MIMEHeader reuse** — `textproto.MIMEHeader` is cast directly to `map[string][]string` instead of copied
 
-### Benchmark results (AMD Ryzen 5 7600X)
+### Micro-benchmark results (AMD Ryzen 5 7600X)
 
 | Operation | ns/op | B/op | allocs/op |
 |-----------|-------|------|-----------|
-| EncodeParams (18 keys) | 418 | 576 | 1 |
-| WriteRecord (1 KB) | 21 | 8 | 1 |
-| ReadRecord (1 KB) | 257 | 1091 | 3 |
-| WriteStreamFromReader (8 KB) | 163 | 56 | 2 |
-| ParseHTTPResponse | 699 | 1136 | 12 |
-| ReadResponse (full round-trip) | 621 | 1196 | 13 |
+| EncodeParams (18 keys) | 425 | 576 | 1 |
+| WriteRecord (1 KB) | 23 | 8 | 1 |
+| ReadRecord (1 KB) | 274 | 1093 | 3 |
+| WriteStreamFromReader (8 KB) | 169 | 56 | 2 |
+| ParseHTTPResponse | 706 | 1136 | 12 |
+| ReadResponse (full round-trip) | 615 | 1110 | 12 |
 | BuildEnvKey | 16 | 0 | 0 |
 | IsBlockedHeader | 13 | 0 | 0 |
 
-Run benchmarks:
+### fcgi-proxy vs nginx — comparative benchmark
+
+Both proxying to the same PHP-FPM backend (50 children, `pm = static`), 10-second test duration.
+
+**Throughput (requests in 10s):**
+
+| Test | fcgi-proxy | nginx | Diff |
+|------|-----------|-------|------|
+| Minimal JSON (GET, 50c) | **254,297** | 168,320 | **+51%** |
+| Front-controller (GET /, 50c) | **257,313** | 161,263 | **+60%** |
+| Heavy workload (GET, 10KB resp, 50c) | **147,693** | 126,056 | **+17%** |
+| POST with body (50c) | **246,976** | 161,365 | **+53%** |
+| Health check (50c) | **913,235** | 888,454 | **+3%** |
+| High concurrency (GET, 200c) | **259,729** | 152,274 | **+71%** |
+
+**Latency p50 (ms):**
+
+| Test | fcgi-proxy | nginx |
+|------|-----------|-------|
+| Minimal JSON | **0.6** | 1.5 |
+| Front-controller | **0.9** | 1.8 |
+| Heavy workload | **2.2** | 3.5 |
+| POST with body | **0.9** | 1.9 |
+| Health check | 0.5 | 0.5 |
+| High concurrency (200c) | **1.7** | 12.5 |
+
+Run the comparative benchmark:
+
+```bash
+cd benchmark
+docker compose up -d
+./run.sh 10s 50
+docker compose down
+```
+
+Run micro-benchmarks:
 
 ```bash
 go test -bench=. -benchmem ./fcgi/ ./proxy/

@@ -38,6 +38,8 @@ type Config struct {
 	ResponseHeaders map[string]string
 	// Locations defines external proxy locations with caching.
 	Locations []locationcache.Location
+	// Pool configures the FastCGI connection pool.
+	Pool fcgi.PoolConfig
 }
 
 // Headers that must not be forwarded from the upstream response (lowercase for case-insensitive lookup).
@@ -81,6 +83,7 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 		DialTimeout:  cfg.DialTimeout,
 		ReadTimeout:  cfg.ReadTimeout,
 		WriteTimeout: cfg.WriteTimeout,
+		Pool:         cfg.Pool,
 	})
 
 	// Build location cache for external proxy locations.

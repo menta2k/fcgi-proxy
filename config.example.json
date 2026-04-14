@@ -9,6 +9,8 @@
   "write_timeout": "30s",
   "max_body_size": 10485760,
   "max_concurrency": 1024,
+  "pool_max_idle": 16,
+  "pool_idle_timeout": "30s",
   "response_headers": {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
