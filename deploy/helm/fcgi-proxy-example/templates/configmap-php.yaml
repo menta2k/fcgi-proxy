@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "fcgi-proxy-example.fullname" . }}-php
+  labels:
+    {{- include "fcgi-proxy-example.labels" . | nindent 4 }}
+data:
+  index.php: |
+    <?php
+    header('Content-Type: application/json');
+
+    $info = [
+        'message'  => 'Hello from PHP-FPM behind fcgi-proxy!',
+        'php'      => PHP_VERSION,
+        'server'   => $_SERVER['SERVER_SOFTWARE'] ?? 'unknown',
+        'method'   => $_SERVER['REQUEST_METHOD'],
+        'uri'      => $_SERVER['REQUEST_URI'],
+        'host'     => $_SERVER['SERVER_NAME'],
+        'port'     => $_SERVER['SERVER_PORT'],
+        'remote'   => $_SERVER['REMOTE_ADDR'],
+        'protocol' => $_SERVER['SERVER_PROTOCOL'],
+        'time'     => date('c'),
+    ];
+
+    echo json_encode($info, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+
+  phpinfo.php: |
+    <?php
+    phpinfo();

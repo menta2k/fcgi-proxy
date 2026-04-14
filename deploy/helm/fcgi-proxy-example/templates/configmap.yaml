@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "fcgi-proxy-example.fullname" . }}-proxy
+  labels:
+    {{- include "fcgi-proxy-example.labels" . | nindent 4 }}
+data:
+  config.json: |
+    {
+      "listen": {{ .Values.config.listen | quote }},
+      "network": {{ .Values.config.network | quote }},
+      "address": {{ .Values.config.address | quote }},
+      "document_root": {{ .Values.config.documentRoot | quote }},
+      "index": {{ .Values.config.index | quote }},
+      "dial_timeout": {{ .Values.config.dialTimeout | quote }},
+      "read_timeout": {{ .Values.config.readTimeout | quote }},
+      "write_timeout": {{ .Values.config.writeTimeout | quote }},
+      "max_body_size": {{ .Values.config.maxBodySize | int }},
+      "max_concurrency": {{ .Values.config.maxConcurrency | int }},
+      "pool_max_idle": {{ .Values.config.poolMaxIdle | int }},
+      "pool_idle_timeout": {{ .Values.config.poolIdleTimeout | quote }}
+      {{- if .Values.config.responseHeaders }},
+      "response_headers": {
+        {{- $first := true }}
+        {{- range $key, $val := .Values.config.responseHeaders }}
+        {{- if not $first }},{{ end }}
+        {{ $key | quote }}: {{ $val | quote }}
+        {{- $first = false }}
+        {{- end }}
+      }
+      {{- end }}
+    }

@@ -1,0 +1,5 @@
+config.json
+config.local.json
+fcgi-proxy
+cover.out
+*.out

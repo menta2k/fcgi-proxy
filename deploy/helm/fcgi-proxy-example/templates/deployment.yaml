@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fcgi-proxy-example.fullname" . }}
+  labels:
+    {{- include "fcgi-proxy-example.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "fcgi-proxy-example.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/php: {{ include (print $.Template.BasePath "/configmap-php.yaml") . | sha256sum }}
+      labels:
+        {{- include "fcgi-proxy-example.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        # PHP-FPM — the FastCGI backend
+        - name: php-fpm
+          image: "{{ .Values.phpFpm.image.repository }}:{{ .Values.phpFpm.image.tag }}"
+          imagePullPolicy: {{ .Values.phpFpm.image.pullPolicy }}
+          ports:
+            - name: fcgi
+              containerPort: 9000
+              protocol: TCP
+          volumeMounts:
+            - name: php-app
+              mountPath: /var/www/html
+          resources:
+            {{- toYaml .Values.phpFpm.resources | nindent 12 }}
+
+        # fcgi-proxy — the HTTP-to-FastCGI sidecar
+        - name: fcgi-proxy
+          image: "{{ .Values.proxy.image.repository }}:{{ .Values.proxy.image.tag }}"
+          imagePullPolicy: {{ .Values.proxy.image.pullPolicy }}
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          args:
+            - -config
+            - /etc/fcgi-proxy/config.json
+          ports:
+            - name: http
+              containerPort: {{ .Values.proxy.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          volumeMounts:
+            - name: proxy-config
+              mountPath: /etc/fcgi-proxy
+              readOnly: true
+          resources:
+            {{- toYaml .Values.proxy.resources | nindent 12 }}
+
+      volumes:
+        - name: proxy-config
+          configMap:
+            name: {{ include "fcgi-proxy-example.fullname" . }}-proxy
+        - name: php-app
+          configMap:
+            name: {{ include "fcgi-proxy-example.fullname" . }}-php
