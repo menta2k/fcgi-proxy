@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sko/fcgi-proxy/fcgi"
-	"github.com/sko/fcgi-proxy/proxy/locationcache"
+	"github.com/menta2k/fcgi-proxy/fcgi"
+	"github.com/menta2k/fcgi-proxy/proxy/locationcache"
 	"github.com/valyala/fasthttp"
 )
 

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sko/fcgi-proxy/fcgi"
+	"github.com/menta2k/fcgi-proxy/fcgi"
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttputil"
 )

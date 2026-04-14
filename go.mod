@@ -1,4 +1,4 @@
-module github.com/sko/fcgi-proxy
+module github.com/menta2k/fcgi-proxy
 
 go 1.25.4
 

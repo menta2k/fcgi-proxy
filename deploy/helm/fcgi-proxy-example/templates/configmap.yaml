@@ -16,7 +16,9 @@ data:
       "read_timeout": {{ .Values.config.readTimeout | quote }},
       "write_timeout": {{ .Values.config.writeTimeout | quote }},
       "max_body_size": {{ .Values.config.maxBodySize | int }},
-      "max_concurrency": {{ .Values.config.maxConcurrency | int }}
+      "max_concurrency": {{ .Values.config.maxConcurrency | int }},
+      "pool_max_idle": {{ .Values.config.poolMaxIdle | int }},
+      "pool_idle_timeout": {{ .Values.config.poolIdleTimeout | quote }}
       {{- if .Values.config.responseHeaders }},
       "response_headers": {
         {{- $first := true }}

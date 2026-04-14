@@ -8,10 +8,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/sko/fcgi-proxy/config"
-	"github.com/sko/fcgi-proxy/fcgi"
-	"github.com/sko/fcgi-proxy/proxy"
-	"github.com/sko/fcgi-proxy/proxy/locationcache"
+	"github.com/menta2k/fcgi-proxy/config"
+	"github.com/menta2k/fcgi-proxy/fcgi"
+	"github.com/menta2k/fcgi-proxy/proxy"
+	"github.com/menta2k/fcgi-proxy/proxy/locationcache"
 	"github.com/valyala/fasthttp"
 )
 

@@ -38,6 +38,8 @@ config:
   writeTimeout: "30s"
   maxBodySize: 10485760
   maxConcurrency: 1024
+  poolMaxIdle: 32
+  poolIdleTimeout: "30s"
   responseHeaders:
     X-Content-Type-Options: nosniff
     X-Frame-Options: DENY

@@ -283,16 +283,40 @@ Both proxying to the same PHP-FPM backend (50 children, `pm = static`), 10-secon
 | Health check | 0.5 | 0.5 |
 | High concurrency (200c) | **1.7** | 12.5 |
 
-Run the comparative benchmark:
+### Running the comparative benchmark
+
+A full benchmark suite is included in `benchmark/` that runs fcgi-proxy and nginx side-by-side against the same PHP-FPM backend. It tests 6 scenarios: minimal JSON, front-controller routing, heavy workload (~10 KB response), POST with body, health check, and high concurrency (200 connections).
+
+**Requirements:** Docker, Docker Compose, [hey](https://github.com/rakyll/hey) (`go install github.com/rakyll/hey@latest`)
 
 ```bash
 cd benchmark
+
+# Start PHP-FPM (50 children), fcgi-proxy, and nginx
 docker compose up -d
-./run.sh 10s 50
+
+# Run all tests (default: 10s duration, 50 concurrency)
+./run.sh
+
+# Custom duration and concurrency
+./run.sh 30s 100
+
+# Clean up
 docker compose down
 ```
 
-Run micro-benchmarks:
+The benchmark stack:
+- `php-fpm` — PHP 8.3 FPM Alpine with `pm.max_children = 50`
+- `fcgi-proxy` — built from source, listening on port 8081
+- `nginx` — nginx 1.27 Alpine with equivalent FastCGI config, listening on port 8082
+- Both proxies connect to the same PHP-FPM container over TCP
+
+**Included PHP test scripts:**
+- `www/index.php` — minimal JSON response (~60 bytes)
+- `www/heavy.php` — 100 users with md5 hashes (~10 KB response)
+- `www/echo.php` — echoes POST body metadata
+
+### Running micro-benchmarks
 
 ```bash
 go test -bench=. -benchmem ./fcgi/ ./proxy/
