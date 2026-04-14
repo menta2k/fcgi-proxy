@@ -18,7 +18,7 @@ type PoolConfig struct {
 // DefaultPoolConfig returns sensible pool defaults.
 func DefaultPoolConfig() PoolConfig {
 	return PoolConfig{
-		MaxIdle:     16,
+		MaxIdle:     32,
 		IdleTimeout: 30 * time.Second,
 	}
 }
@@ -36,8 +36,8 @@ type ConnPool struct {
 	maxIdle     int
 	idleTimeout time.Duration
 
-	mu    sync.Mutex
-	idle  []pooledConn
+	mu     sync.Mutex
+	idle   []pooledConn
 	closed atomic.Bool
 
 	stopEvict chan struct{}
@@ -46,7 +46,7 @@ type ConnPool struct {
 // NewConnPool creates a connection pool with background eviction of idle connections.
 func NewConnPool(network, address string, dialTimeout time.Duration, cfg PoolConfig) *ConnPool {
 	if cfg.MaxIdle <= 0 {
-		cfg.MaxIdle = 16
+		cfg.MaxIdle = 32
 	}
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = 30 * time.Second
@@ -67,46 +67,27 @@ func NewConnPool(network, address string, dialTimeout time.Duration, cfg PoolCon
 }
 
 // Get returns a connection from the pool or dials a new one.
+// No liveness probe is performed — dead connections are detected on the
+// first write/read and discarded by the caller. This eliminates 3 syscalls
+// per reuse (SetReadDeadline + Read + SetReadDeadline).
 func (p *ConnPool) Get() (net.Conn, error) {
 	p.mu.Lock()
 	for len(p.idle) > 0 {
 		// Pop from the end (LIFO — most recently used, most likely alive).
 		n := len(p.idle) - 1
 		pc := p.idle[n]
+		p.idle[n] = pooledConn{} // clear reference for GC
 		p.idle = p.idle[:n]
 		p.mu.Unlock()
 
-		// Check if the connection has been idle too long.
+		// Discard connections that have been idle too long.
 		if time.Since(pc.idleSince) > p.idleTimeout {
 			pc.Conn.Close()
 			p.mu.Lock()
 			continue
 		}
 
-		// Liveness check: set a very short read deadline, attempt a 1-byte read.
-		// A live idle connection returns a timeout error (no data available).
-		// A dead connection returns EOF or another error.
-		_ = pc.Conn.SetReadDeadline(time.Now().Add(time.Millisecond))
-		var probe [1]byte
-		_, err := pc.Conn.Read(probe[:])
-		// Reset deadline for actual use.
-		_ = pc.Conn.SetReadDeadline(time.Time{})
-
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				// Timeout means the connection is alive — no data was waiting.
-				return pc.Conn, nil
-			}
-			// EOF or other error — connection is dead.
-			pc.Conn.Close()
-			p.mu.Lock()
-			continue
-		}
-
-		// If we actually read a byte, the server sent unexpected data — discard.
-		pc.Conn.Close()
-		p.mu.Lock()
-		continue
+		return pc.Conn, nil
 	}
 	p.mu.Unlock()
 

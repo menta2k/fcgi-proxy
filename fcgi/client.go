@@ -174,27 +174,29 @@ func (c *Client) readResponse(conn net.Conn, requestID uint16) (Response, error)
 
 	stdout := stdoutBufPool.Get().(*bytes.Buffer)
 	stdout.Reset()
-	defer func() {
+	stderr := stderrBufPool.Get().(*bytes.Buffer)
+	stderr.Reset()
+
+	// returnBufs puts both buffers back to the pool, discarding oversized ones.
+	returnBufs := func() {
 		if stdout.Cap() > maxPooledBufCap {
 			stdoutBufPool.Put(new(bytes.Buffer))
 		} else {
 			stdoutBufPool.Put(stdout)
 		}
-	}()
-
-	stderr := stderrBufPool.Get().(*bytes.Buffer)
-	stderr.Reset()
-	defer func() {
 		if stderr.Cap() > maxPooledBufCap {
 			stderrBufPool.Put(new(bytes.Buffer))
 		} else {
 			stderrBufPool.Put(stderr)
 		}
-	}()
+	}
 
 	for {
-		rec, err := ReadRecord(conn)
+		// ReadRecordInto appends stdout/stderr content directly into the buffers,
+		// eliminating the per-record content copy.
+		rec, err := ReadRecordInto(conn, stdout, stderr, maxResponseBody, maxResponseStderr)
 		if err != nil {
+			returnBufs()
 			return Response{}, err
 		}
 
@@ -202,25 +204,18 @@ func (c *Client) readResponse(conn net.Conn, requestID uint16) (Response, error)
 			continue
 		}
 
-		switch rec.Header.Type {
-		case TypeStdout:
-			if stdout.Len()+len(rec.Content) > maxResponseBody {
-				return Response{}, fmt.Errorf("fcgi: response body exceeds %d bytes", maxResponseBody)
-			}
-			stdout.Write(rec.Content)
-		case TypeStderr:
-			if stderr.Len()+len(rec.Content) <= maxResponseStderr {
-				stderr.Write(rec.Content)
-			}
-		case TypeEndRequest:
+		if rec.Header.Type == TypeEndRequest {
 			if len(rec.Content) >= 5 && rec.Content[4] != StatusRequestComplete {
+				returnBufs()
 				return Response{}, fmt.Errorf("fcgi: upstream refused request (protocol status %d)", rec.Content[4])
 			}
-			stdoutBytes := make([]byte, stdout.Len())
-			copy(stdoutBytes, stdout.Bytes())
-			stderrBytes := make([]byte, stderr.Len())
-			copy(stderrBytes, stderr.Bytes())
-			return parseHTTPResponse(stdoutBytes, stderrBytes)
+
+			// Parse directly from the buffer bytes. parseHTTPResponse does not
+			// retain references to the input slices (it copies via textproto),
+			// so we can return the buffers to the pool after parsing.
+			resp, parseErr := parseHTTPResponse(stdout.Bytes(), stderr.Bytes())
+			returnBufs()
+			return resp, parseErr
 		}
 	}
 }

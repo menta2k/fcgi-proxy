@@ -88,7 +88,7 @@ func DefaultConfig() Config {
 		WriteTimeout:   "30s",
 		MaxBodySize:     10 * 1024 * 1024, // 10 MB
 		MaxConcurrency:  1024,
-		PoolMaxIdle:     16,
+		PoolMaxIdle:     32,
 		PoolIdleTimeout: "30s",
 	}
 }
