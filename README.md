@@ -8,6 +8,7 @@
 ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/menta2k/fcgi-proxy?logo=go)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/menta2k/fcgi-proxy/badge)](https://scorecard.dev/viewer/?uri=github.com/menta2k/fcgi-proxy)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12549/badge)](https://www.bestpractices.dev/projects/12549)
 [![Project Status: Active](https://www.repostatus.org/badges/latest/active.svg)](https://www.repostatus.org/#active)
 
 A high-performance reverse proxy that sits in front of FastCGI servers like PHP-FPM. Built with [fasthttp](https://github.com/valyala/fasthttp) for minimal overhead and optimized for low memory allocations per request.
