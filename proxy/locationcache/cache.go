@@ -76,6 +76,19 @@ func New(locations []Location, fetchTimeout time.Duration) *Cache {
 	}
 }
 
+// NewWithClient creates a Cache with a custom http.Client (for testing without SSRF guard).
+func NewWithClient(locations []Location, client *http.Client) *Cache {
+	locMap := make(map[string]Location, len(locations))
+	for _, loc := range locations {
+		locMap[loc.Path] = loc
+	}
+	return &Cache{
+		locations: locMap,
+		entries:   make(map[string]Entry),
+		client:    client,
+	}
+}
+
 // Match returns the location for the given path, or false if not configured.
 func (c *Cache) Match(path string) (Location, bool) {
 	loc, ok := c.locations[path]

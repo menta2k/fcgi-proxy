@@ -263,6 +263,66 @@ func TestWriteStream_Empty(t *testing.T) {
 	}
 }
 
+func TestClient_Close(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go mockFCGIServer(t, ln, "Content-Type: text/html\r\nStatus: 200 OK", "ok")
+
+	client := NewClient(ClientConfig{
+		Network:      "tcp",
+		Address:      ln.Addr().String(),
+		DialTimeout:  2 * time.Second,
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
+	})
+
+	// Do a request to populate the pool.
+	_, err = client.Do(Request{Params: map[string]string{"REQUEST_METHOD": "GET"}})
+	if err != nil {
+		t.Fatalf("Do error: %v", err)
+	}
+
+	// Close should not panic.
+	client.Close()
+
+	// Double close should not panic.
+	client.Close()
+}
+
+func TestClient_Do_WriteError(t *testing.T) {
+	// Connect to a server that immediately closes the connection.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		conn.Close() // immediately close
+	}()
+	defer ln.Close()
+
+	client := NewClient(ClientConfig{
+		Network:      "tcp",
+		Address:      ln.Addr().String(),
+		DialTimeout:  2 * time.Second,
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
+	})
+	defer client.Close()
+
+	_, err = client.Do(Request{Params: map[string]string{"REQUEST_METHOD": "GET"}})
+	if err == nil {
+		t.Fatal("expected error when server closes connection immediately")
+	}
+}
+
 func TestNewClient(t *testing.T) {
 	cfg := ClientConfig{
 		Network:      "tcp",

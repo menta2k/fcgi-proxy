@@ -38,6 +38,8 @@ type Config struct {
 	ResponseHeaders map[string]string
 	// Locations defines external proxy locations with caching.
 	Locations []locationcache.Location
+	// LocationCache is an optional pre-built cache (for testing). If set, Locations is ignored.
+	LocationCache *locationcache.Cache
 	// Pool configures the FastCGI connection pool.
 	Pool fcgi.PoolConfig
 }
@@ -88,7 +90,9 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 
 	// Build location cache for external proxy locations.
 	var locCache *locationcache.Cache
-	if len(cfg.Locations) > 0 {
+	if cfg.LocationCache != nil {
+		locCache = cfg.LocationCache
+	} else if len(cfg.Locations) > 0 {
 		locCache = locationcache.New(cfg.Locations, cfg.ReadTimeout)
 	}
 

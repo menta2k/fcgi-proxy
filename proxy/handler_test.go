@@ -313,3 +313,103 @@ func TestTruncate(t *testing.T) {
 		t.Errorf("truncate(11, 100) = %q, want full string", got)
 	}
 }
+
+func TestIsBlockedHeader_LongKey(t *testing.T) {
+	// Keys longer than 64 bytes are never blocked.
+	longKey := make([]byte, 100)
+	for i := range longKey {
+		longKey[i] = 'x'
+	}
+	if isBlockedHeader(longKey) {
+		t.Error("long key should not be blocked")
+	}
+}
+
+func TestIsBlockedHeader_AllBlocked(t *testing.T) {
+	blocked := []string{
+		"Content-Type", "content-type", "CONTENT-TYPE",
+		"Content-Length", "Connection", "Transfer-Encoding",
+		"Proxy", "PROXY", "X-Forwarded-For", "X-Real-IP", "Trailer",
+	}
+	for _, h := range blocked {
+		if !isBlockedHeader([]byte(h)) {
+			t.Errorf("%q should be blocked", h)
+		}
+	}
+}
+
+func TestIsBlockedHeader_NotBlocked(t *testing.T) {
+	notBlocked := []string{"Accept", "Host", "X-Custom", "Authorization"}
+	for _, h := range notBlocked {
+		if isBlockedHeader([]byte(h)) {
+			t.Errorf("%q should not be blocked", h)
+		}
+	}
+}
+
+func TestBuildEnvKey_Valid(t *testing.T) {
+	tests := []struct {
+		key  string
+		want string
+	}{
+		{"Accept", "HTTP_ACCEPT"},
+		{"x-custom", "HTTP_X_CUSTOM"},
+		{"X-Forwarded-Proto", "HTTP_X_FORWARDED_PROTO"},
+		{"Host", "HTTP_HOST"},
+	}
+	var buf [256]byte
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			got, ok := buildEnvKey(buf[:0], []byte(tt.key))
+			if !ok {
+				t.Fatalf("buildEnvKey(%q) returned false", tt.key)
+			}
+			if string(got) != tt.want {
+				t.Errorf("buildEnvKey(%q) = %q, want %q", tt.key, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildEnvKey_Rejected(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+	}{
+		{"empty", ""},
+		{"too long", string(make([]byte, 252))},
+		{"digit only", "123"},
+		{"space", "X Custom"},
+		{"colon", "X:Custom"},
+		{"underscore", "X_Custom"},
+		{"null byte", "X\x00Custom"},
+	}
+	var buf [256]byte
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ok := buildEnvKey(buf[:0], []byte(tt.key))
+			if ok {
+				t.Errorf("buildEnvKey(%q) should be rejected", tt.key)
+			}
+		})
+	}
+}
+
+func TestFixRelativeLocation_NoTrailingSlash(t *testing.T) {
+	got := fixRelativeLocation("/admin/page.php", "./other")
+	if got != "/admin/other" {
+		t.Errorf("got %q, want /admin/other", got)
+	}
+}
+
+func TestResolveScript_CleanPathInfo(t *testing.T) {
+	cfg := Config{Index: "index.php"}
+	_, _, pathInfo, err := resolveScript("/index.php/../../../etc/passwd", "/var/www/html", cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// path.Clean should remove the .. sequences from PATH_INFO
+	if strings.Contains(pathInfo, "..") {
+		t.Errorf("pathInfo should be cleaned, got %q", pathInfo)
+	}
+}

@@ -1,6 +1,7 @@
 package locationcache
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -339,5 +340,129 @@ func TestIsPrivateIP(t *testing.T) {
 		if isPrivateIP(net.ParseIP(ip)) {
 			t.Errorf("%s should not be private", ip)
 		}
+	}
+}
+
+func TestSSRFGuard_BlocksPrivateRanges(t *testing.T) {
+	tests := []struct {
+		name    string
+		addr    string
+		blocked bool
+	}{
+		{"loopback", "http://127.0.0.1:80/", true},
+		{"private 10.x", "http://10.0.0.1:80/", true},
+		{"private 192.168.x", "http://192.168.1.1:80/", true},
+		{"private 172.16.x", "http://172.16.0.1:80/", true},
+		{"metadata", "http://169.254.169.254:80/", true},
+		{"ipv6 loopback", "http://[::1]:80/", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loc := Location{Path: "/" + tt.name, Upstream: tt.addr, TTL: time.Minute}
+			cache := New([]Location{loc}, 2*time.Second)
+			_, err := cache.Get(loc)
+			if tt.blocked && err == nil {
+				t.Errorf("expected SSRF guard to block %s", tt.addr)
+			}
+		})
+	}
+}
+
+func TestSanitizeURL_Invalid(t *testing.T) {
+	got := sanitizeURL("://invalid")
+	// Should not panic, returns something.
+	if got == "" {
+		t.Error("sanitizeURL should return non-empty for invalid URL")
+	}
+}
+
+func TestCache_StaleEviction(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte("data"))
+	}))
+
+	loc := Location{Path: "/evict-test", Upstream: server.URL, TTL: 1 * time.Millisecond}
+	cache := newTestCache([]Location{loc})
+
+	// Populate cache.
+	_, err := cache.Get(loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Kill server and wait for TTL to expire.
+	server.Close()
+	time.Sleep(5 * time.Millisecond)
+
+	// Manually set FetchedAt to >24h ago to trigger stale eviction.
+	cache.mu.Lock()
+	if entry, ok := cache.entries[loc.Path]; ok {
+		entry.FetchedAt = time.Now().Add(-25 * time.Hour)
+		cache.entries[loc.Path] = entry
+	}
+	cache.mu.Unlock()
+
+	// Should fail — stale entry is too old and should be evicted.
+	_, err = cache.Get(loc)
+	if err == nil {
+		t.Fatal("expected error after stale entry exceeds maxStaleAge")
+	}
+
+	// Verify the entry was actually deleted.
+	cache.mu.RLock()
+	_, exists := cache.entries[loc.Path]
+	cache.mu.RUnlock()
+	if exists {
+		t.Error("stale entry should have been evicted from the map")
+	}
+}
+
+func TestCache_CheckRedirectPerRequest(t *testing.T) {
+	// Verify that redirect counting is per-request, not global.
+	redirectCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if redirectCount < 3 {
+			redirectCount++
+			http.Redirect(w, r, r.URL.Path, http.StatusFound)
+			return
+		}
+		w.WriteHeader(200)
+		w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	loc := Location{Path: "/redirect-test", Upstream: server.URL + "/redirect-test", TTL: 0}
+	// Use NewWithClient with a redirect-limited client (same as New but no SSRF guard).
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+	cache := NewWithClient([]Location{loc}, client)
+
+	// First request: 3 redirects then 200.
+	entry, err := cache.Get(loc)
+	if err != nil {
+		t.Fatalf("first request error: %v", err)
+	}
+	if entry.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", entry.StatusCode)
+	}
+
+	// Reset server redirect counter.
+	redirectCount = 0
+
+	// Second request should also work (redirect count is per-request).
+	entry, err = cache.Get(loc)
+	if err != nil {
+		t.Fatalf("second request error: %v", err)
+	}
+	if entry.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", entry.StatusCode)
 	}
 }
