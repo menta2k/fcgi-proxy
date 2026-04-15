@@ -1,5 +1,15 @@
 # fcgi-proxy
 
+[![CI](https://github.com/menta2k/fcgi-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/menta2k/fcgi-proxy/actions/workflows/ci.yml)
+[![Release](https://github.com/menta2k/fcgi-proxy/actions/workflows/release.yml/badge.svg)](https://github.com/menta2k/fcgi-proxy/actions/workflows/release.yml)
+[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/menta2k/fcgi-proxy?logo=github&sort=semver)](https://github.com/menta2k/fcgi-proxy/releases/latest)
+[![Go Report Card](https://goreportcard.com/badge/github.com/menta2k/fcgi-proxy)](https://goreportcard.com/report/github.com/menta2k/fcgi-proxy)
+[![codecov](https://codecov.io/gh/menta2k/fcgi-proxy/branch/main/graph/badge.svg)](https://codecov.io/gh/menta2k/fcgi-proxy)
+![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/menta2k/fcgi-proxy?logo=go)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/menta2k/fcgi-proxy/badge)](https://scorecard.dev/viewer/?uri=github.com/menta2k/fcgi-proxy)
+[![Project Status: Active](https://www.repostatus.org/badges/latest/active.svg)](https://www.repostatus.org/#active)
+
 A high-performance reverse proxy that sits in front of FastCGI servers like PHP-FPM. Built with [fasthttp](https://github.com/valyala/fasthttp) for minimal overhead and optimized for low memory allocations per request.
 
 ## Features
