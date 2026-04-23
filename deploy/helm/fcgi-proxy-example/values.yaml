@@ -27,23 +27,6 @@ proxy:
       cpu: 200m
       memory: 64Mi
 
-config:
-  listen: ":8080"
-  network: "tcp"
-  address: "127.0.0.1:9000"
-  documentRoot: "/var/www/html"
-  index: "index.php"
-  dialTimeout: "5s"
-  readTimeout: "30s"
-  writeTimeout: "30s"
-  maxBodySize: 10485760
-  maxConcurrency: 1024
-  poolMaxIdle: 32
-  poolIdleTimeout: "30s"
-  responseHeaders:
-    X-Content-Type-Options: nosniff
-    X-Frame-Options: DENY
-
 service:
   type: ClusterIP
   port: 80
@@ -58,3 +41,93 @@ ingress:
         - path: /
           pathType: Prefix
   tls: []
+
+# -----------------------------------------------------------------------------
+# fcgi-proxy configuration.
+#
+# Keys here are passed verbatim (via `toPrettyJson`) into the rendered
+# config.json, so they must use snake_case exactly as documented in the
+# README's Configuration section. Any field supported by the proxy can be
+# added here without touching the ConfigMap template.
+# -----------------------------------------------------------------------------
+config:
+  listen: ":8080"
+  network: "tcp"
+  address: "127.0.0.1:9000"
+  document_root: "/var/www/html"
+  index: "index.php"
+  dial_timeout: "5s"
+  read_timeout: "30s"
+  write_timeout: "30s"
+  max_body_size: 10485760
+  max_concurrency: 1024
+  pool_max_idle: 32
+  pool_idle_timeout: "30s"
+
+  # Headers injected on every proxied response.
+  response_headers:
+    X-Content-Type-Options: nosniff
+    X-Frame-Options: DENY
+
+  # Location cache / static-return rules.
+  # Each entry must have either `upstream` (cached reverse proxy to an
+  # external URL) OR `return` (inline static response) — never both.
+  # See README "Location Cache" for the full option list.
+  locations: []
+  # locations:
+  #   - path: /apple-app-site-association
+  #     upstream: https://assets.example.com/universal-links/apple-app-site-association
+  #     cache_ttl: 1h
+  #   - path: /robots.txt
+  #     return:
+  #       status: 200
+  #       body: |
+  #         User-agent: *
+  #         Disallow:
+  #       content_type: text/plain
+
+  # Cross-Origin Resource Sharing.
+  # See README "CORS" section for all fields and behavior details.
+  cors:
+    enabled: false
+  # cors:
+  #   enabled: true
+  #   allowed_origins:
+  #     - https://app.example.com
+  #     - app://localhost
+  #   allowed_methods: [GET, POST, PUT, DELETE, OPTIONS]
+  #   allowed_headers: [Content-Type, Authorization]
+  #   exposed_headers: [X-Request-Id]
+  #   allow_credentials: false
+  #   max_age: 10m
+
+  # HTTP authentication (Digest or Basic).
+  # /healthz, CORS preflights, and configured `locations` bypass the gate.
+  # See README "Authentication" section for HA1 / bcrypt generation.
+  auth:
+    enabled: false
+  # Digest example:
+  # auth:
+  #   enabled: true
+  #   type: digest
+  #   realm: fcgi-proxy
+  #   algorithm: SHA-256        # or MD5
+  #   nonce_lifetime: 5m
+  #   users:
+  #     - username: alice
+  #       # printf '%s' 'alice:fcgi-proxy:s3cret' | sha256sum
+  #       ha1: 0000000000000000000000000000000000000000000000000000000000000000
+  #
+  # Basic example:
+  # auth:
+  #   enabled: true
+  #   type: basic
+  #   realm: fcgi-proxy
+  #   users:
+  #     - username: alice
+  #       # htpasswd -B -n alice
+  #       password_hash: $2b$10$replace_with_real_bcrypt_hash_here_____________
+  #   password_cache:
+  #     enabled: true
+  #     ttl: 1m
+  #     max_entries: 10000
