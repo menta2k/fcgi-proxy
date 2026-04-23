@@ -19,10 +19,9 @@ A high-performance reverse proxy that sits in front of FastCGI servers like PHP-
 - Robust CGI parameter construction (SERVER_NAME, REMOTE_ADDR, PATH_INFO, etc.)
 - **Location cache** — proxy specific paths to external HTTP servers with in-memory caching
 - **Static responses** — inline `return` bodies for paths like `/robots.txt` (nginx `location { return 200 '...'; }` equivalent), served with zero upstream calls and zero hot-path allocations
-- **Authentication** — HTTP Digest (RFC 7616, SHA-256 or MD5) and HTTP Basic (RFC 7617, bcrypt hashes) — enabled via `auth` config block; `/healthz` and configured `locations` bypass the auth gate. Basic auth uses an in-memory HMAC-keyed password cache (Caddy-style) to avoid re-running bcrypt on every request — ~1000× speedup at `bcrypt.MinCost`, scaling with cost. Cache only stores successful authentications so failures remain rate-limited by bcrypt. The HMAC secret is per-process and regenerated on restart, so a memory dump without the running secret is useless for offline password cracking.
-  - **Operator note:** rotating a password in `config.json` requires a process restart (SIGTERM + start) to flush the cache. If the process keeps running with an updated config file, previously-cached credentials stay valid for up to `password_cache.ttl` (default 1 min).
+- **Authentication** — HTTP Digest (RFC 7616) or Basic (RFC 7617), with an HMAC-keyed bcrypt cache for Basic. Per-location bypass. See [Authentication](#authentication).
 - **Configurable response headers** — inject security headers (HSTS, X-Frame-Options, etc.) into every response
-- **Configurable CORS** — preflight handling, origin allowlist, credentials, exposed headers, and max-age driven entirely from `config.json`
+- **Configurable CORS** — RFC-compliant origin allowlist, preflight handling, credentials, zero-allocation hot path. See [CORS](#cors).
 - **Memory-optimized** — `sync.Pool` for hot-path buffers, zero-allocation header processing, pre-sized maps
 - Path traversal prevention with `filepath.Rel` boundary checks
 - httpoxy (CVE-2016-5385) protection
@@ -147,6 +146,8 @@ Copy `config.example.json` to `config.json` and edit as needed.
 | Pool idle timeout | `pool_idle_timeout` | - | `30s` | How long an idle connection can sit unused before being closed (1s to 5m) |
 | Response headers | `response_headers` | - | `{}` | Map of headers added to every response (see below) |
 | Locations | `locations` | - | `[]` | External proxy locations with caching (see below) |
+| CORS | `cors` | - | `{"enabled": false}` | Cross-Origin Resource Sharing config (see [CORS](#cors)) |
+| Authentication | `auth` | - | `{"enabled": false}` | HTTP Digest or Basic authentication (see [Authentication](#authentication)) |
 
 ### Response Headers
 
@@ -209,6 +210,204 @@ Proxy specific paths to external HTTP/HTTPS servers and cache the response. This
 - Upstream URLs must not contain credentials (`user:pass@host` is rejected at config validation).
 - Error messages in logs have credentials stripped from URLs.
 
+### CORS
+
+Cross-Origin Resource Sharing handled at the proxy, independently of what the backend would do. When enabled, the proxy short-circuits preflight (`OPTIONS`) requests locally and injects the appropriate `Access-Control-*` headers on simple responses. When disabled, the proxy is transparent and the backend can handle CORS itself.
+
+```json
+{
+  "cors": {
+    "enabled": true,
+    "allowed_origins": ["https://app.example.com", "app://localhost"],
+    "allowed_methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    "allowed_headers": ["Content-Type", "Authorization"],
+    "exposed_headers": ["X-Request-Id"],
+    "allow_credentials": false,
+    "max_age": "10m"
+  }
+}
+```
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `enabled` | yes | `false` | Master switch. When `false`, the block is ignored and CORS is not applied. |
+| `allowed_origins` | yes (when enabled) | — | Exact-match allowlist. Supports `http://`, `https://`, `app://` (Cordova/hybrid mobile) schemes, the literal `"null"` (sandboxed iframes / `file://`), and the wildcard `"*"`. Scheme/host compared case-insensitively per RFC 6454. |
+| `allowed_methods` | no | `[]` | Echoed in preflight `Access-Control-Allow-Methods`. Methods are normalized to upper case. Must be valid HTTP methods (`GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`). |
+| `allowed_headers` | no | `[]` | Echoed in preflight `Access-Control-Allow-Headers`. When unset, the proxy echoes the value of the client's `Access-Control-Request-Headers` after validation (rs/cors default). Entries are header-name-validated (alphanumeric + hyphen) or `"*"`. |
+| `exposed_headers` | no | `[]` | Sent as `Access-Control-Expose-Headers` on simple responses. Validated like `allowed_headers`. |
+| `allow_credentials` | no | `false` | When `true`, the response includes `Access-Control-Allow-Credentials: true`. Cannot be combined with `"*"` in `allowed_origins` or with `"null"` (both rejected at config load). |
+| `max_age` | no | — | Preflight cache duration. Pre-formatted at parse time; range `0` to `24h`. Omit or set to `0` to omit the header. |
+
+**Behavior details:**
+
+- **Preflight** (`OPTIONS` with `Access-Control-Request-Method` header) is answered by the proxy with `204 No Content` — the FastCGI backend is never consulted.
+- **Origin-allowed simple requests** get `Access-Control-Allow-Origin: <origin>` (exact echo) or `*` in wildcard-no-credentials mode; credentialed responses always echo the specific origin.
+- **`Vary: Origin`** is emitted on every CORS-sensitive response, including rejected preflights (403) and simple requests from disallowed origins, to prevent shared-cache poisoning.
+- **Origin scheme validation**: `http://`, `https://`, `app://`, or literal `"null"`. Anything else is rejected at parse time.
+- **Port validation**: hostnames with a `:port` suffix require a decimal port in `1..65535`. Malformed entries like `app://loc:alhost` are rejected.
+- **Case-insensitive origin matching**: browsers normalize origins to lowercase; the proxy lowercases the configured allowlist at parse time and does a zero-allocation fast path for already-lowercase request origins.
+- **Bypass paths**: `/healthz` and configured `locations` (both static-return and cached-upstream entries) are not CORS-gated. If you need CORS on those paths, handle it upstream.
+
+**Security hardening (already in place):**
+
+- `Access-Control-Request-Headers` is validated for CR/LF/NUL before being echoed back, preventing response-splitting attacks.
+- When CORS is enabled, `Origin`, `Access-Control-Request-Method`, and `Access-Control-Request-Headers` are stripped from the CGI environment forwarded to PHP-FPM — the proxy is the single CORS authority.
+- `response_headers` entries starting with `Access-Control-` are rejected at config load when CORS is enabled (no silent override).
+- `allow_credentials: true` combined with `"*"` or `"null"` origins is rejected at parse time (classic CORS footguns).
+- The fasthttp request parser strips CR/LF from header values before the CORS middleware sees them; the NUL check is defense in depth.
+
+**Benchmark** (AMD Ryzen 5 7600X, isolated middleware work):
+
+| Path | ns/op | B/op | allocs/op |
+|------|------:|-----:|----------:|
+| Preflight (allowed origin) | 401 | 0 | 0 |
+| Simple cross-origin request | 181 | 0 | 0 |
+| CORS disabled (fast-path return) | 2.6 | 0 | 0 |
+| Origin case-fold (slow path) | 16.8 | 0 | 0 |
+
+### Authentication
+
+HTTP authentication applied at the proxy, in front of the FastCGI backend. Two schemes are supported: **Digest** (RFC 7616) and **Basic** (RFC 7617). Exactly one scheme is active at a time.
+
+```json
+{
+  "auth": {
+    "enabled": true,
+    "type": "digest",
+    "realm": "fcgi-proxy",
+    "algorithm": "SHA-256",
+    "nonce_lifetime": "5m",
+    "users": [
+      { "username": "alice", "ha1": "<64-hex for SHA-256, 32-hex for MD5>" }
+    ]
+  }
+}
+```
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `enabled` | yes | `false` | Master switch. When `false`, the block is ignored. |
+| `type` | no | `digest` | `digest` or `basic`. |
+| `realm` | yes (when enabled) | — | Sent in the `WWW-Authenticate` challenge. Must not contain `CR`, `LF`, NUL, or double-quote. |
+| `algorithm` | digest only | `SHA-256` | `SHA-256` (recommended) or `MD5` (legacy, for old clients). |
+| `nonce_lifetime` | digest only | `5m` | How long a server-issued nonce stays valid. `30s` to `24h`. |
+| `users` | yes (when enabled) | — | Inline user database. Maximum 1000 entries. See per-scheme fields below. |
+| `password_cache` | basic only | enabled with defaults | bcrypt result cache (see below). |
+
+**Bypass paths** (not gated by auth):
+
+- `/healthz` — load-balancer probes stay reachable.
+- CORS preflight (`OPTIONS` with `Access-Control-Request-Method`) — browsers strip the `Authorization` header from preflights, so gating them would break every CORS-using client. The CORS middleware handles preflights before the auth gate.
+- Configured `locations` — both `return` (inline static) and cached-upstream entries. If a path is in your `locations`, it serves without auth.
+
+Everything else — the FastCGI backend, script resolution, the entire `index.php` front-controller — requires valid credentials.
+
+#### Digest
+
+Credentials are stored as **HA1 hex** (`H(username:realm:password)`), never plaintext. Compute with:
+
+```bash
+# SHA-256 (default)
+printf '%s' 'alice:fcgi-proxy:s3cret' | sha256sum
+
+# MD5 (legacy)
+printf '%s' 'alice:fcgi-proxy:s3cret' | md5sum
+```
+
+| User field | Description |
+|------------|-------------|
+| `username` | Must not contain `:`, `CR`, `LF`, NUL, or double-quote. |
+| `ha1` | Lowercase hex of `H(username:realm:password)`. 64 chars for `SHA-256`, 32 for `MD5`. |
+
+**Nonce design:** stateless, HMAC-signed. The proxy does not keep a nonce store; nonces are self-verifying base64 of `timestamp || 16 random bytes || HMAC-SHA-256(secret, timestamp||random)[:16]`. On process restart, the HMAC secret is regenerated — clients present the old (now-invalid) nonce, the server responds with `stale=true`, and compliant clients re-auth silently without reprompting.
+
+**Hardening in place:**
+
+- `qop=auth` is required; the RFC 2069 qop-absent fallback is rejected to prevent downgrade.
+- Client-supplied `algorithm=` parameter must match the configured algorithm, preventing hash-function downgrade.
+- Client-supplied `uri=` must match the actual request target (RFC 7616 §3.4) — prevents replay of a captured `Authorization` header against a different URI within the nonce lifetime.
+- Unknown-username responses run a dummy HMAC pass to equalize response time with wrong-password responses — no user enumeration via timing.
+- Response compare uses `crypto/subtle.ConstantTimeCompare`; realm compare uses the same.
+- Header parser tolerates `key ="value"` (trailing whitespace) and unescapes `\"` in quoted values.
+
+**Trade-off:** no `nc` (nonce-count) tracking — a captured valid `Authorization` header can be replayed within the nonce lifetime. Deploy over TLS, and consider a short `nonce_lifetime` (e.g. `30s`) for high-value endpoints on plain HTTP.
+
+#### Basic
+
+Credentials are stored as **bcrypt hashes**. Generate with `htpasswd`:
+
+```bash
+# Cost 10 (default for htpasswd -B)
+htpasswd -B -n alice
+
+# Explicit cost (12 recommended for sensitive endpoints)
+htpasswd -B -C 12 -n alice
+```
+
+| User field | Description |
+|------------|-------------|
+| `username` | Must not contain `:`, `CR`, `LF`, NUL, or double-quote. |
+| `password_hash` | bcrypt hash starting with `$2a$`, `$2b$`, or `$2y$`. Plaintext is rejected at config load. |
+
+Config example:
+
+```json
+{
+  "auth": {
+    "enabled": true,
+    "type": "basic",
+    "realm": "fcgi-proxy",
+    "users": [
+      { "username": "alice", "password_hash": "$2b$10$..." }
+    ],
+    "password_cache": {
+      "enabled": true,
+      "ttl": "1m",
+      "max_entries": 10000
+    }
+  }
+}
+```
+
+**Hardening in place:**
+
+- Unknown-username path runs a dummy bcrypt compare **at the same cost as the slowest configured hash** — determined at parse time. No user enumeration via timing.
+- Plaintext passwords are rejected at config load (prefix check: must start with `$2a$`, `$2b$`, or `$2y$`).
+- Empty passwords are allowed if the stored hash matches, per RFC 7617.
+- Passwords containing `:` work correctly (split on the first `:` only).
+- Base64 decode uses a 512-byte stack buffer; oversized `Authorization` headers are rejected without spilling to heap.
+
+##### Password cache
+
+bcrypt verification at cost 10 takes ~50 ms. Without a cache, a single authenticated request caps a CPU core at ~10–20 RPS — a 1000× throughput regression vs the unauthenticated case. The proxy includes a Caddy-style in-memory cache to avoid re-running bcrypt on every request.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `password_cache.enabled` | `true` | Set to `false` to disable the cache and pay the full bcrypt cost on every request. |
+| `password_cache.ttl` | `1m` | How long a successful auth stays cached. Range `1s` to `1h`. |
+| `password_cache.max_entries` | `10000` | Upper bound on cached entries. Range `1` to `1,000,000`. |
+
+**Design:**
+
+- Cache **only successful** authentications. Failures and unknown users always run bcrypt, so the cache cannot accelerate brute-force attacks.
+- Keys are HMAC-SHA-256(secret, `stored_hash || 0x00 || password`) with a per-cache 32-byte random secret. Binding to the stored hash means rotating a password automatically orphans prior entries. The HMAC secret makes a partial memory dump (map bytes only) useless for offline password cracking.
+- Eviction is lazy: on `set` at capacity, expired entries are dropped first, then — if still full — half the map is bulk-dropped (map iteration order as pseudo-random eviction). No background goroutines.
+- Hot path: atomic-counter RLock + map lookup + `time.Now()` compare. Zero allocations, 12 ns/op.
+- HMAC derivation also zero-allocation via pre-computed inner/outer pads and stack-buffered SHA-256.
+
+**Performance (AMD Ryzen 5 7600X, `bcrypt.MinCost`):**
+
+| Path | ns/op | allocs/op |
+|------|------:|----------:|
+| Cache hit (Authorization → success) | 643 | 8 |
+| Cache miss (bcrypt MinCost verify) | 673,020 | 19 |
+| Cache hit isolated (`check` only) | 12 | 0 |
+| HMAC key derivation isolated | 217 | 0 |
+
+Speedup: **1046×** at `MinCost`, scaling linearly with bcrypt cost. At operator cost 10 (~50 ms bcrypt), the speedup approaches **~77,000×**.
+
+**Operator note on password rotation:** the cache is rebuilt when the process restarts (new HMAC secret, empty map). Editing `config.json` in place without restarting the process will keep cached credentials valid for up to `password_cache.ttl` (default 1 minute). For immediate rotation, send `SIGTERM` and start the proxy again.
+
 ### Timeout format
 
 Timeouts use Go duration strings: `100ms`, `5s`, `1m30s`, `1h`, etc. All timeouts must be between `100ms` and `5m`. Cache TTLs have no upper bound (use `0` to disable caching and always fetch).
@@ -227,7 +426,9 @@ At startup, the proxy validates:
 - `pool_max_idle` is between 1 and 1024
 - `pool_idle_timeout` is between 1s and 5m
 - `response_headers` keys are alphanumeric/hyphens; values have no CR/LF/null
-- `locations` paths start with `/`; upstreams are `http://` or `https://` without credentials; TTLs are non-negative; maximum 100 locations
+- `locations` paths start with `/`; upstreams are `http://` or `https://` without credentials; TTLs are non-negative; maximum 100 locations; each entry is either `upstream`- or `return`-shaped (never both)
+- `cors` origins have `http://`/`https://`/`app://` schemes with valid host[:port]; `allow_credentials` + `"*"` or `"null"` rejected; `max_age` ≤ 24h; `response_headers` cannot contain `Access-Control-*` keys while CORS is enabled
+- `auth` realm is non-empty and free of CR/LF/NUL/quote; digest users supply HA1 matching the algorithm hash size; basic users supply bcrypt-prefixed password hashes; `password_cache` applies only to Basic
 
 Invalid configuration causes the proxy to exit with a clear error message.
 
