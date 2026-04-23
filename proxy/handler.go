@@ -49,6 +49,10 @@ type Config struct {
 	// CORS configures Cross-Origin Resource Sharing. When Enabled is false,
 	// CORS handling is a no-op.
 	CORS config.ParsedCORS
+	// Auth configures HTTP authentication applied before the FCGI dispatch.
+	// Bypasses /healthz, static locations, and cached upstream locations
+	// (they serve before the auth check runs).
+	Auth config.ParsedAuth
 }
 
 // StaticResponse is a materialized inline response served for a configured
@@ -111,6 +115,14 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 		locCache = locationcache.New(cfg.Locations, cfg.ReadTimeout)
 	}
 
+	// Build the Basic-auth password cache once per Handler invocation so
+	// repeated requests with the same credentials skip the bcrypt cost.
+	// Nil for disabled or non-basic schemes.
+	var pwCache *passwordCache
+	if cfg.Auth.Enabled && cfg.Auth.Type == config.AuthTypeBasic && cfg.Auth.PasswordCacheEnabled {
+		pwCache = newPasswordCache(cfg.Auth.PasswordCacheTTL, cfg.Auth.PasswordCacheMaxEntries)
+	}
+
 	cleanDocRoot := filepath.Clean(cfg.DocumentRoot)
 
 	return func(ctx *fasthttp.RequestCtx) {
@@ -149,6 +161,23 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 		if locCache != nil {
 			if loc, ok := locCache.Match(uriPath); ok {
 				serveLocationCache(ctx, locCache, loc, cfg.ResponseHeaders)
+				applyCORSResponseHeaders(ctx, cfg.CORS, corsResult)
+				return
+			}
+		}
+
+		// Authentication gate: at this point we've exhausted /healthz, static,
+		// and cached-upstream locations, so anything falling through is bound
+		// for FCGI. Auth is checked here so configured bypasses happen
+		// naturally without per-path list maintenance.
+		//
+		// Intentional ordering: auth runs BEFORE the null-byte URI check
+		// below. An unauthenticated null-byte URI therefore receives 401 (not
+		// 400). Leaking "your request was well-formed but unauthenticated"
+		// information to an anonymous client is safer than leaking validation
+		// details about the request shape.
+		if cfg.Auth.Enabled {
+			if !authenticate(ctx, cfg.Auth, pwCache) {
 				applyCORSResponseHeaders(ctx, cfg.CORS, corsResult)
 				return
 			}
