@@ -38,7 +38,15 @@ type passwordCache struct {
 }
 
 func newPasswordCache(ttl time.Duration, maxSize int) *passwordCache {
-	initial := max(maxSize/4, 16)
+	// Cap the initial map hint so that a permissive `max_entries` (e.g. 1M)
+	// does not balloon idle memory with buckets that will never be used.
+	// Operators commonly set a high ceiling for headroom while only touching
+	// a small active working set. The map will grow naturally as entries are
+	// inserted — amortized cost is O(n) for n inserts.
+	initial := min(maxSize, 1024)
+	if initial < 16 {
+		initial = 16
+	}
 	c := &passwordCache{
 		entries: make(map[[sha256.Size]byte]int64, initial),
 		ttl:     ttl,

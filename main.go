@@ -4,9 +4,12 @@ import (
 	"flag"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof/* on http.DefaultServeMux
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/menta2k/fcgi-proxy/config"
 	"github.com/menta2k/fcgi-proxy/fcgi"
@@ -21,7 +24,12 @@ func main() {
 	network := flag.String("network", "", "fcgi network: tcp or unix (overrides config)")
 	address := flag.String("address", "", "fcgi upstream address (overrides config)")
 	docRoot := flag.String("document-root", "", "document root (overrides config)")
+	pprofAddr := flag.String("pprof", "", "enable pprof profiling on this address (e.g., 127.0.0.1:6060). DO NOT expose publicly — bind to loopback only")
 	flag.Parse()
+
+	if *pprofAddr != "" {
+		startPprof(*pprofAddr)
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -115,6 +123,24 @@ func main() {
 	if err := server.Shutdown(); err != nil {
 		log.Printf("Shutdown error: %v", err)
 	}
+}
+
+// startPprof brings up the Go runtime profiler on a dedicated HTTP server.
+// Bind to a loopback address — the pprof handlers leak internal state and
+// allow remote callers to trigger long profiling runs that stall the process.
+func startPprof(addr string) {
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      http.DefaultServeMux,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
+	}
+	go func() {
+		log.Printf("pprof listening on %s (http://%s/debug/pprof/)", addr, addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("pprof server error: %v", err)
+		}
+	}()
 }
 
 // derivePort extracts the port from a listen address like ":8080" or "0.0.0.0:9090".
