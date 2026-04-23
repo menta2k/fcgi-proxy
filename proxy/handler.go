@@ -41,11 +41,22 @@ type Config struct {
 	Locations []locationcache.Location
 	// LocationCache is an optional pre-built cache (for testing). If set, Locations is ignored.
 	LocationCache *locationcache.Cache
+	// StaticLocations defines paths that serve a pre-built inline response
+	// without any upstream call. Matched by exact path before the cache.
+	StaticLocations map[string]StaticResponse
 	// Pool configures the FastCGI connection pool.
 	Pool fcgi.PoolConfig
 	// CORS configures Cross-Origin Resource Sharing. When Enabled is false,
 	// CORS handling is a no-op.
 	CORS config.ParsedCORS
+}
+
+// StaticResponse is a materialized inline response served for a configured
+// location path. Fields correspond to config.ParsedReturn.
+type StaticResponse struct {
+	Status      int
+	Body        []byte
+	ContentType string
 }
 
 // Headers that must not be forwarded from the upstream response (lowercase for case-insensitive lookup).
@@ -121,6 +132,17 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 			ctx.SetBodyString("ok")
 			applyCORSResponseHeaders(ctx, cfg.CORS, corsResult)
 			return
+		}
+
+		// Serve a pre-built inline response if this path has one configured.
+		// Runs before the location cache so static entries bypass the fetch
+		// path entirely and also win over any upstream with the same path.
+		if len(cfg.StaticLocations) > 0 {
+			if resp, ok := cfg.StaticLocations[uriPath]; ok {
+				serveStatic(ctx, resp, cfg.ResponseHeaders)
+				applyCORSResponseHeaders(ctx, cfg.CORS, corsResult)
+				return
+			}
 		}
 
 		// Serve from location cache if the path matches a configured location.
@@ -457,6 +479,20 @@ func buildEnvKey(buf, key []byte) ([]byte, bool) {
 		return nil, false
 	}
 	return buf, true
+}
+
+// serveStatic writes a pre-built inline response. The body is served by
+// reference (SetBody on the pre-allocated slice), so the hot path performs
+// no allocations for the response content itself.
+func serveStatic(ctx *fasthttp.RequestCtx, resp StaticResponse, responseHeaders map[string]string) {
+	ctx.SetStatusCode(resp.Status)
+	if resp.ContentType != "" {
+		ctx.SetContentType(resp.ContentType)
+	}
+	ctx.SetBody(resp.Body)
+	for key, val := range responseHeaders {
+		ctx.Response.Header.Set(key, val)
+	}
 }
 
 // serveLocationCache serves a response from the location cache.

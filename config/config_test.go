@@ -364,6 +364,146 @@ func TestParse_Locations_CredentialsInUpstream(t *testing.T) {
 	}
 }
 
+func TestParse_Locations_StaticReturn_Valid(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Locations = []LocationConfig{{
+		Path: "/robots.txt",
+		Return: &ReturnConfig{
+			Status:      200,
+			Body:        "User-agent: *\nDisallow:",
+			ContentType: "text/plain",
+		},
+	}}
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(parsed.Locations) != 1 {
+		t.Fatalf("got %d locations, want 1", len(parsed.Locations))
+	}
+	loc := parsed.Locations[0]
+	if loc.Return == nil {
+		t.Fatal("expected ParsedReturn to be populated")
+	}
+	if loc.Upstream != "" {
+		t.Errorf("Upstream = %q, must be empty for static entry", loc.Upstream)
+	}
+	if loc.Return.Status != 200 {
+		t.Errorf("Status = %d, want 200", loc.Return.Status)
+	}
+	if string(loc.Return.Body) != "User-agent: *\nDisallow:" {
+		t.Errorf("Body = %q", loc.Return.Body)
+	}
+	if loc.Return.ContentType != "text/plain" {
+		t.Errorf("ContentType = %q", loc.Return.ContentType)
+	}
+}
+
+func TestParse_Locations_StaticReturn_Defaults(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Locations = []LocationConfig{{
+		Path:   "/empty",
+		Return: &ReturnConfig{Body: "ok"},
+	}}
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	loc := parsed.Locations[0]
+	if loc.Return.Status != 200 {
+		t.Errorf("default Status = %d, want 200", loc.Return.Status)
+	}
+	if loc.Return.ContentType != "text/plain; charset=utf-8" {
+		t.Errorf("default ContentType = %q", loc.Return.ContentType)
+	}
+}
+
+func TestParse_Locations_StaticReturn_MutualExclusion(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Locations = []LocationConfig{{
+		Path:     "/both",
+		Upstream: "https://example.com/",
+		Return:   &ReturnConfig{Body: "x"},
+	}}
+	if _, err := Parse(cfg); err == nil {
+		t.Fatal("expected error when both upstream and return are set")
+	}
+}
+
+func TestParse_Locations_StaticReturn_MissingBoth(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Locations = []LocationConfig{{Path: "/neither"}}
+	if _, err := Parse(cfg); err == nil {
+		t.Fatal("expected error when neither upstream nor return is set")
+	}
+}
+
+func TestParse_Locations_StaticReturn_InvalidStatus(t *testing.T) {
+	tests := []int{-1, 0, 99, 600, 9999}
+	// 0 is handled as "default to 200" so we explicitly exclude it.
+	tests = tests[:0]
+	tests = append(tests, -1, 99, 600, 9999)
+	for _, s := range tests {
+		cfg := DefaultConfig()
+		cfg.Locations = []LocationConfig{{
+			Path:   "/bad-status",
+			Return: &ReturnConfig{Status: s, Body: "x"},
+		}}
+		if _, err := Parse(cfg); err == nil {
+			t.Errorf("expected error for status %d", s)
+		}
+	}
+}
+
+func TestParse_Locations_StaticReturn_BodyTooLarge(t *testing.T) {
+	cfg := DefaultConfig()
+	big := strings.Repeat("x", 64*1024+1) // 64 KiB + 1
+	cfg.Locations = []LocationConfig{{
+		Path:   "/too-big",
+		Return: &ReturnConfig{Body: big},
+	}}
+	if _, err := Parse(cfg); err == nil {
+		t.Fatal("expected error for oversized return body")
+	}
+}
+
+func TestParse_Locations_StaticReturn_ContentTypeCRLF(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Locations = []LocationConfig{{
+		Path: "/bad-ct",
+		Return: &ReturnConfig{
+			Body:        "x",
+			ContentType: "text/plain\r\nSet-Cookie: x=1",
+		},
+	}}
+	if _, err := Parse(cfg); err == nil {
+		t.Fatal("expected error for content_type with control characters")
+	}
+}
+
+func TestParse_Locations_StaticReturn_CacheTTLRejected(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Locations = []LocationConfig{{
+		Path:     "/static-ttl",
+		CacheTTL: "1h",
+		Return:   &ReturnConfig{Body: "x"},
+	}}
+	if _, err := Parse(cfg); err == nil {
+		t.Fatal("expected error for cache_ttl on a static return entry")
+	}
+}
+
+func TestParse_Locations_DuplicatePath(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Locations = []LocationConfig{
+		{Path: "/dup", Return: &ReturnConfig{Body: "a"}},
+		{Path: "/dup", Return: &ReturnConfig{Body: "b"}},
+	}
+	if _, err := Parse(cfg); err == nil {
+		t.Fatal("expected error for duplicate location path")
+	}
+}
+
 func TestParse_Locations_TooMany(t *testing.T) {
 	cfg := DefaultConfig()
 	for i := range 101 {

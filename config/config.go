@@ -42,18 +42,39 @@ type CORSConfig struct {
 	MaxAge           string   `json:"max_age"`
 }
 
-// LocationConfig defines an external proxy location with caching.
+// LocationConfig defines a location rule. Each entry must set either Upstream
+// (cached reverse proxy to an external URL) OR Return (inline static response),
+// but not both.
 type LocationConfig struct {
-	Path     string `json:"path"`
-	Upstream string `json:"upstream"`
-	CacheTTL string `json:"cache_ttl"`
+	Path     string        `json:"path"`
+	Upstream string        `json:"upstream,omitempty"`
+	CacheTTL string        `json:"cache_ttl,omitempty"`
+	Return   *ReturnConfig `json:"return,omitempty"`
 }
 
-// ParsedLocation holds a validated location config.
+// ReturnConfig describes an inline static response served for a location —
+// the nginx `return 200 '...';` equivalent.
+type ReturnConfig struct {
+	Status      int    `json:"status"`       // defaults to 200
+	Body        string `json:"body"`         // required (may be empty string for 204/304)
+	ContentType string `json:"content_type"` // defaults to "text/plain; charset=utf-8"
+}
+
+// ParsedLocation holds a validated location config. Exactly one of
+// Upstream and Return is populated.
 type ParsedLocation struct {
 	Path     string
 	Upstream string
 	CacheTTL time.Duration
+	Return   *ParsedReturn
+}
+
+// ParsedReturn is a pre-built static response. Body is materialized once at
+// parse time so the request hot path only does SetBody(b), zero allocations.
+type ParsedReturn struct {
+	Status      int
+	Body        []byte
+	ContentType string
 }
 
 // Parsed holds validated, parsed config values ready for use.
@@ -97,6 +118,7 @@ const (
 	maxAllowedBodySize    = 256 * 1024 * 1024 // 256 MB
 	maxAllowedConcurrency = 65535
 	maxLocations          = 100
+	maxReturnBodySize     = 64 * 1024 // 64 KiB — anything larger belongs on a real upstream
 )
 
 var allowedNetworks = map[string]bool{
@@ -193,35 +215,57 @@ func Parse(cfg Config) (Parsed, error) {
 	}
 
 	parsedLocations := make([]ParsedLocation, 0, len(cfg.Locations))
+	seenPaths := make(map[string]struct{}, len(cfg.Locations))
 	for i, loc := range cfg.Locations {
 		if loc.Path == "" || loc.Path[0] != '/' {
 			return Parsed{}, fmt.Errorf("config: locations[%d].path must be an absolute path starting with /", i)
 		}
-		if loc.Upstream == "" {
-			return Parsed{}, fmt.Errorf("config: locations[%d].upstream must not be empty", i)
+		if _, dup := seenPaths[loc.Path]; dup {
+			return Parsed{}, fmt.Errorf("config: locations[%d].path %q is duplicated", i, loc.Path)
 		}
-		if !strings.HasPrefix(loc.Upstream, "http://") && !strings.HasPrefix(loc.Upstream, "https://") {
-			return Parsed{}, fmt.Errorf("config: locations[%d].upstream must start with http:// or https://, got %q", i, loc.Upstream)
+		seenPaths[loc.Path] = struct{}{}
+
+		hasUpstream := loc.Upstream != ""
+		hasReturn := loc.Return != nil
+		if hasUpstream && hasReturn {
+			return Parsed{}, fmt.Errorf("config: locations[%d] must set either upstream or return, not both", i)
 		}
-		if strings.Contains(loc.Upstream, "@") {
-			return Parsed{}, fmt.Errorf("config: locations[%d].upstream must not contain credentials (found @)", i)
+		if !hasUpstream && !hasReturn {
+			return Parsed{}, fmt.Errorf("config: locations[%d] must set one of upstream or return", i)
 		}
-		ttl := 5 * time.Minute // default
-		if loc.CacheTTL != "" {
-			var parseErr error
-			ttl, parseErr = time.ParseDuration(loc.CacheTTL)
-			if parseErr != nil {
-				return Parsed{}, fmt.Errorf("config: locations[%d].cache_ttl %q is invalid: %w", i, loc.CacheTTL, parseErr)
+
+		parsed := ParsedLocation{Path: loc.Path}
+		if hasReturn {
+			if loc.CacheTTL != "" {
+				return Parsed{}, fmt.Errorf("config: locations[%d].cache_ttl is not applicable to static return", i)
 			}
-			if ttl < 0 {
-				return Parsed{}, fmt.Errorf("config: locations[%d].cache_ttl must not be negative", i)
+			ret, err := parseReturnConfig(loc.Return, i)
+			if err != nil {
+				return Parsed{}, err
 			}
+			parsed.Return = ret
+		} else {
+			if !strings.HasPrefix(loc.Upstream, "http://") && !strings.HasPrefix(loc.Upstream, "https://") {
+				return Parsed{}, fmt.Errorf("config: locations[%d].upstream must start with http:// or https://, got %q", i, loc.Upstream)
+			}
+			if strings.Contains(loc.Upstream, "@") {
+				return Parsed{}, fmt.Errorf("config: locations[%d].upstream must not contain credentials (found @)", i)
+			}
+			ttl := 5 * time.Minute // default
+			if loc.CacheTTL != "" {
+				var parseErr error
+				ttl, parseErr = time.ParseDuration(loc.CacheTTL)
+				if parseErr != nil {
+					return Parsed{}, fmt.Errorf("config: locations[%d].cache_ttl %q is invalid: %w", i, loc.CacheTTL, parseErr)
+				}
+				if ttl < 0 {
+					return Parsed{}, fmt.Errorf("config: locations[%d].cache_ttl must not be negative", i)
+				}
+			}
+			parsed.Upstream = loc.Upstream
+			parsed.CacheTTL = ttl
 		}
-		parsedLocations = append(parsedLocations, ParsedLocation{
-			Path:     loc.Path,
-			Upstream: loc.Upstream,
-			CacheTTL: ttl,
-		})
+		parsedLocations = append(parsedLocations, parsed)
 	}
 
 	if cfg.MaxBodySize <= 0 || cfg.MaxBodySize > maxAllowedBodySize {
@@ -384,6 +428,37 @@ func parseCORS(c CORSConfig) (ParsedCORS, error) {
 		ExposedHeaders:   exposed,
 		AllowCredentials: c.AllowCredentials,
 		MaxAge:           maxAge,
+	}, nil
+}
+
+// parseReturnConfig validates and materializes a static return response.
+// Body is copied into a new []byte exactly once so the request hot path can
+// serve it with a plain SetBody call and zero allocations.
+func parseReturnConfig(r *ReturnConfig, locIndex int) (*ParsedReturn, error) {
+	status := r.Status
+	if status == 0 {
+		status = 200
+	}
+	if status < 100 || status > 599 {
+		return nil, fmt.Errorf("config: locations[%d].return.status %d is out of range 100-599", locIndex, status)
+	}
+	if len(r.Body) > maxReturnBodySize {
+		return nil, fmt.Errorf("config: locations[%d].return.body is %d bytes, exceeds %d", locIndex, len(r.Body), maxReturnBodySize)
+	}
+
+	contentType := r.ContentType
+	if contentType == "" {
+		contentType = "text/plain; charset=utf-8"
+	}
+	if strings.ContainsAny(contentType, "\r\n\x00") {
+		return nil, fmt.Errorf("config: locations[%d].return.content_type contains invalid characters", locIndex)
+	}
+
+	body := []byte(r.Body)
+	return &ParsedReturn{
+		Status:      status,
+		Body:        body,
+		ContentType: contentType,
 	}, nil
 }
 

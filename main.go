@@ -48,9 +48,22 @@ func main() {
 
 	listenPort := derivePort(parsed.Listen)
 
-	// Convert parsed locations to locationcache.Location entries.
+	// Partition parsed locations: upstream-cached entries feed locationcache,
+	// static-return entries feed the static dispatch map.
 	var locations []locationcache.Location
+	var staticLocations map[string]proxy.StaticResponse
 	for _, loc := range parsed.Locations {
+		if loc.Return != nil {
+			if staticLocations == nil {
+				staticLocations = make(map[string]proxy.StaticResponse, len(parsed.Locations))
+			}
+			staticLocations[loc.Path] = proxy.StaticResponse{
+				Status:      loc.Return.Status,
+				Body:        loc.Return.Body,
+				ContentType: loc.Return.ContentType,
+			}
+			continue
+		}
 		locations = append(locations, locationcache.Location{
 			Path:     loc.Path,
 			Upstream: loc.Upstream,
@@ -69,6 +82,7 @@ func main() {
 		WriteTimeout:    parsed.WriteTimeout,
 		ResponseHeaders: parsed.ResponseHeaders,
 		Locations:       locations,
+		StaticLocations: staticLocations,
 		CORS:            parsed.CORS,
 		Pool: fcgi.PoolConfig{
 			MaxIdle:     parsed.PoolMaxIdle,

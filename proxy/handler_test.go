@@ -4,6 +4,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/valyala/fasthttp"
 )
 
 func TestResolveScript_Basic(t *testing.T) {
@@ -411,5 +414,106 @@ func TestResolveScript_CleanPathInfo(t *testing.T) {
 	// path.Clean should remove the .. sequences from PATH_INFO
 	if strings.Contains(pathInfo, "..") {
 		t.Errorf("pathInfo should be cleaned, got %q", pathInfo)
+	}
+}
+
+func newHandlerCtx(method, uri string) *fasthttp.RequestCtx {
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Request.Header.SetMethod(method)
+	ctx.Request.SetRequestURI(uri)
+	return ctx
+}
+
+func TestHandler_StaticLocation_ServesInlineBody(t *testing.T) {
+	body := "Sitemap: https://example.com/sitemap.xml\nUser-agent: *\nDisallow:"
+	h := Handler(Config{
+		Network:      "tcp",
+		Address:      "127.0.0.1:9000",
+		DocumentRoot: "/var/www/html",
+		Index:        "index.php",
+		StaticLocations: map[string]StaticResponse{
+			"/robots.txt": {Status: 200, Body: []byte(body), ContentType: "text/plain"},
+		},
+	})
+	ctx := newHandlerCtx("GET", "/robots.txt")
+	h(ctx)
+	if ctx.Response.StatusCode() != 200 {
+		t.Errorf("status = %d, want 200", ctx.Response.StatusCode())
+	}
+	if got := string(ctx.Response.Body()); got != body {
+		t.Errorf("body = %q, want %q", got, body)
+	}
+	if got := string(ctx.Response.Header.ContentType()); got != "text/plain" {
+		t.Errorf("content-type = %q", got)
+	}
+}
+
+func TestHandler_StaticLocation_RespectsResponseHeaders(t *testing.T) {
+	h := Handler(Config{
+		Network:      "tcp",
+		Address:      "127.0.0.1:9000",
+		DocumentRoot: "/var/www/html",
+		Index:        "index.php",
+		ResponseHeaders: map[string]string{
+			"X-Frame-Options": "DENY",
+		},
+		StaticLocations: map[string]StaticResponse{
+			"/robots.txt": {Status: 200, Body: []byte("ok"), ContentType: "text/plain"},
+		},
+	})
+	ctx := newHandlerCtx("GET", "/robots.txt")
+	h(ctx)
+	if got := string(ctx.Response.Header.Peek("X-Frame-Options")); got != "DENY" {
+		t.Errorf("X-Frame-Options = %q, want DENY", got)
+	}
+}
+
+func TestHandler_StaticLocation_OnlyExactPath(t *testing.T) {
+	h := Handler(Config{
+		// Point at an unreachable unix socket so the FCGI fall-through fails
+		// fast without a long TCP dial, keeping this test well under 1s.
+		Network:      "unix",
+		Address:      "/nonexistent.sock",
+		DocumentRoot: "/var/www/html",
+		Index:        "index.php",
+		DialTimeout:  1 * time.Millisecond,
+		StaticLocations: map[string]StaticResponse{
+			"/robots.txt": {Status: 200, Body: []byte("ok"), ContentType: "text/plain"},
+		},
+	})
+	// /robots.txt/extra does not exact-match; should not serve the static entry.
+	// It falls through to the FCGI path and returns 502 — the important thing
+	// is it's NOT the static body.
+	ctx := newHandlerCtx("GET", "/robots.txt/extra")
+	h(ctx)
+	if got := string(ctx.Response.Body()); got == "ok" {
+		t.Errorf("static response leaked onto non-matching path")
+	}
+}
+
+func TestHandler_StaticLocation_ZeroAllocHotPath(t *testing.T) {
+	body := []byte("User-agent: *\nDisallow:")
+	h := Handler(Config{
+		Network:      "tcp",
+		Address:      "127.0.0.1:9000",
+		DocumentRoot: "/var/www/html",
+		Index:        "index.php",
+		StaticLocations: map[string]StaticResponse{
+			"/robots.txt": {Status: 200, Body: body, ContentType: "text/plain"},
+		},
+	})
+	ctx := newHandlerCtx("GET", "/robots.txt")
+	// Warm-up: first call exercises fasthttp's internal growth paths.
+	h(ctx)
+	allocs := testing.AllocsPerRun(50, func() {
+		ctx.Response.Reset()
+		h(ctx)
+	})
+	// fasthttp internally allocates for status-line serialization on a fresh
+	// response; we only care that the static-serve logic itself doesn't
+	// add noticeable allocations beyond that. A handful (<5) is expected from
+	// fasthttp's own machinery; anything >20 means we're copying the body.
+	if allocs > 5 {
+		t.Errorf("static serve allocated %.1f times per run, want ≤5", allocs)
 	}
 }

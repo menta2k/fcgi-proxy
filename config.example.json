@@ -35,6 +35,14 @@
       "path": "/.well-known/assetlinks.json",
       "upstream": "https://assets.example.com/android/assetlinks.json",
       "cache_ttl": "1h"
+    },
+    {
+      "path": "/robots.txt",
+      "return": {
+        "status": 200,
+        "body": "Sitemap: https://www.example.com/sitemap.xml\nUser-agent: *\nDisallow:",
+        "content_type": "text/plain"
+      }
     }
   ]
 }
