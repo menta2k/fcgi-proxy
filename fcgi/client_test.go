@@ -184,7 +184,7 @@ func TestReadResponse_StdoutCap(t *testing.T) {
 	}
 
 	client := &Client{cfg: ClientConfig{}}
-	_, err := client.readResponse(fakeConn{Reader: &buf}, 1)
+	_, _, err := client.readResponse(fakeConn{Reader: &buf}, 1)
 	if err == nil {
 		t.Fatal("expected error for exceeding maxResponseBody")
 	}
@@ -222,7 +222,7 @@ func TestReadResponse_ProtocolStatusRefused(t *testing.T) {
 	}
 
 	client := &Client{cfg: ClientConfig{}}
-	_, err := client.readResponse(fakeConn{Reader: &buf}, 1)
+	_, _, err := client.readResponse(fakeConn{Reader: &buf}, 1)
 	if err == nil {
 		t.Fatal("expected error for non-zero protocol status")
 	}
@@ -246,7 +246,7 @@ func TestReadResponse_ProtocolStatusComplete(t *testing.T) {
 	}
 
 	client := &Client{cfg: ClientConfig{}}
-	resp, err := client.readResponse(fakeConn{Reader: &buf}, 1)
+	resp, _, err := client.readResponse(fakeConn{Reader: &buf}, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

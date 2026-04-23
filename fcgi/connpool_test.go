@@ -41,9 +41,12 @@ func TestConnPool_GetPut(t *testing.T) {
 	pool := NewConnPool("tcp", ln.Addr().String(), 2*time.Second, DefaultPoolConfig())
 	defer pool.Close()
 
-	conn, err := pool.Get()
+	conn, reused, err := pool.Get()
 	if err != nil {
 		t.Fatalf("Get error: %v", err)
+	}
+	if reused {
+		t.Errorf("first Get() reported reused=true on empty pool")
 	}
 
 	if pool.Stats() != 0 {
@@ -63,12 +66,18 @@ func TestConnPool_Reuse(t *testing.T) {
 	defer pool.Close()
 
 	// Get and put a connection.
-	conn1, _ := pool.Get()
+	conn1, reused1, _ := pool.Get()
+	if reused1 {
+		t.Errorf("first Get() reported reused=true on empty pool")
+	}
 	addr1 := conn1.LocalAddr().String()
 	pool.Put(conn1)
 
 	// Get again — should reuse the same connection.
-	conn2, _ := pool.Get()
+	conn2, reused2, _ := pool.Get()
+	if !reused2 {
+		t.Errorf("second Get() reported reused=false after Put")
+	}
 	addr2 := conn2.LocalAddr().String()
 	pool.Put(conn2)
 
@@ -88,11 +97,11 @@ func TestConnPool_MaxIdle(t *testing.T) {
 	// Get 5 connections.
 	conns := make([]net.Conn, 5)
 	for i := range conns {
-		var err error
-		conns[i], err = pool.Get()
+		c, _, err := pool.Get()
 		if err != nil {
 			t.Fatal(err)
 		}
+		conns[i] = c
 	}
 
 	// Put all 5 back. Only 2 should be kept (max idle).
@@ -113,7 +122,7 @@ func TestConnPool_IdleTimeout(t *testing.T) {
 	})
 	defer pool.Close()
 
-	conn, _ := pool.Get()
+	conn, _, _ := pool.Get()
 	pool.Put(conn)
 
 	if pool.Stats() != 1 {
@@ -124,7 +133,7 @@ func TestConnPool_IdleTimeout(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Trigger eviction by trying to Get — expired connections are discarded.
-	conn2, err := pool.Get()
+	conn2, _, err := pool.Get()
 	if err != nil {
 		t.Fatalf("Get error: %v", err)
 	}
@@ -135,7 +144,7 @@ func TestConnPool_Close(t *testing.T) {
 	ln := startTCPEcho(t)
 	pool := NewConnPool("tcp", ln.Addr().String(), 2*time.Second, DefaultPoolConfig())
 
-	conn, _ := pool.Get()
+	conn, _, _ := pool.Get()
 	pool.Put(conn)
 
 	pool.Close()
@@ -154,7 +163,7 @@ func TestConnPool_DeadConnectionDiscarded(t *testing.T) {
 	pool := NewConnPool("tcp", ln.Addr().String(), 2*time.Second, DefaultPoolConfig())
 	defer pool.Close()
 
-	conn, _ := pool.Get()
+	conn, _, _ := pool.Get()
 	pool.Put(conn)
 
 	// Close the listener so the server stops accepting new connections.
@@ -165,7 +174,7 @@ func TestConnPool_DeadConnectionDiscarded(t *testing.T) {
 
 	// The liveness check should detect the dead connection and discard it.
 	// A fresh dial will be attempted, which should fail since the listener is closed.
-	conn2, err := pool.Get()
+	conn2, _, err := pool.Get()
 	if err == nil {
 		// If the liveness check didn't catch it (possible on some OS/timing),
 		// the connection was returned but is dead — this is acceptable.
@@ -187,7 +196,7 @@ func TestConnPool_ConcurrentAccess(t *testing.T) {
 	for range 100 {
 		go func() {
 			defer func() { done <- struct{}{} }()
-			conn, err := pool.Get()
+			conn, _, err := pool.Get()
 			if err != nil {
 				return
 			}

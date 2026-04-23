@@ -67,10 +67,14 @@ func NewConnPool(network, address string, dialTimeout time.Duration, cfg PoolCon
 }
 
 // Get returns a connection from the pool or dials a new one.
+// The reused return value is true when the connection came from the pool
+// (and may therefore be stale), false when it was freshly dialed. Callers
+// can use this to decide whether a connection-level error is retriable.
+//
 // No liveness probe is performed — dead connections are detected on the
 // first write/read and discarded by the caller. This eliminates 3 syscalls
 // per reuse (SetReadDeadline + Read + SetReadDeadline).
-func (p *ConnPool) Get() (net.Conn, error) {
+func (p *ConnPool) Get() (conn net.Conn, reused bool, err error) {
 	p.mu.Lock()
 	for len(p.idle) > 0 {
 		// Pop from the end (LIFO — most recently used, most likely alive).
@@ -87,10 +91,17 @@ func (p *ConnPool) Get() (net.Conn, error) {
 			continue
 		}
 
-		return pc.Conn, nil
+		return pc.Conn, true, nil
 	}
 	p.mu.Unlock()
 
+	conn, err = net.DialTimeout(p.network, p.address, p.dialTimeout)
+	return conn, false, err
+}
+
+// Dial opens a brand-new connection, bypassing the idle pool.
+// Used for retrying after a pooled connection was found to be stale.
+func (p *ConnPool) Dial() (net.Conn, error) {
 	return net.DialTimeout(p.network, p.address, p.dialTimeout)
 }
 

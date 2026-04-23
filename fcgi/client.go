@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/textproto"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -64,42 +66,115 @@ type Request struct {
 
 // Do sends a FastCGI request and returns the response.
 // Connections are reused from the pool when available.
+//
+// If a pooled connection fails with a stale-connection error (EOF,
+// ECONNRESET, EPIPE, "use of closed network connection") before any
+// response bytes are received, Do retries once on a freshly dialed
+// connection. This hides the race where an upstream worker (e.g. a
+// PHP-FPM child hitting pm.max_requests) closes an idle keep-alive
+// socket between requests. The retry only fires when the request body,
+// if any, implements io.Seeker so it can be rewound safely.
 func (c *Client) Do(req Request) (Response, error) {
-	conn, err := c.pool.Get()
+	conn, reused, err := c.pool.Get()
 	if err != nil {
 		return Response{}, fmt.Errorf("fcgi: connect: %w", err)
 	}
 
+	resp, stale, err := c.doOnce(conn, req)
+	if err == nil {
+		return resp, nil
+	}
+
+	// Only retry when the failure is consistent with a stale pooled
+	// connection and the body can be rewound for a second attempt.
+	if !reused || !stale || !rewindStdin(req.Stdin) {
+		return Response{}, err
+	}
+
+	fresh, dialErr := c.pool.Dial()
+	if dialErr != nil {
+		return Response{}, fmt.Errorf("fcgi: connect (retry): %w", dialErr)
+	}
+
+	resp, _, err = c.doOnce(fresh, req)
+	return resp, err
+}
+
+// doOnce performs a single request/response round trip on conn.
+// On error, stale is true when the failure pattern matches a dead
+// pooled connection: no response bytes were consumed and the error is
+// EOF/ECONNRESET/EPIPE (excluding timeouts). conn is always either
+// returned to the pool on success or closed on failure.
+func (c *Client) doOnce(conn net.Conn, req Request) (resp Response, stale bool, err error) {
 	const requestID uint16 = 1
 
-	if err := conn.SetWriteDeadline(time.Now().Add(c.cfg.WriteTimeout)); err != nil {
+	if err = conn.SetWriteDeadline(time.Now().Add(c.cfg.WriteTimeout)); err != nil {
 		conn.Close()
-		return Response{}, fmt.Errorf("fcgi: set write deadline: %w", err)
+		return Response{}, false, fmt.Errorf("fcgi: set write deadline: %w", err)
 	}
 
-	if err := c.writeRequest(conn, requestID, req); err != nil {
+	if err = c.writeRequest(conn, requestID, req); err != nil {
 		conn.Close()
-		return Response{}, fmt.Errorf("fcgi: write request: %w", err)
+		return Response{}, isStaleConnErr(err), fmt.Errorf("fcgi: write request: %w", err)
 	}
 
-	if err := conn.SetReadDeadline(time.Now().Add(c.cfg.ReadTimeout)); err != nil {
+	if err = conn.SetReadDeadline(time.Now().Add(c.cfg.ReadTimeout)); err != nil {
 		conn.Close()
-		return Response{}, fmt.Errorf("fcgi: set read deadline: %w", err)
+		return Response{}, false, fmt.Errorf("fcgi: set read deadline: %w", err)
 	}
 
-	resp, err := c.readResponse(conn, requestID)
+	resp, received, err := c.readResponse(conn, requestID)
 	if err != nil {
 		// Best-effort abort so the upstream can clean up gracefully.
 		_ = conn.SetDeadline(time.Now().Add(time.Second))
 		_ = WriteRecord(conn, TypeAbortRequest, requestID, nil)
 		conn.Close()
-		return Response{}, fmt.Errorf("fcgi: read response: %w", err)
+		stale = !received && isStaleConnErr(err)
+		return Response{}, stale, fmt.Errorf("fcgi: read response: %w", err)
 	}
 
 	// Success — return the connection to the pool for reuse.
 	c.pool.Put(conn)
+	return resp, false, nil
+}
 
-	return resp, nil
+// rewindStdin seeks req.Stdin back to the start if possible, so the
+// request can be replayed on a retry. Returns true when there is no
+// body, or when the body is an io.Seeker that successfully rewound.
+func rewindStdin(r io.Reader) bool {
+	if r == nil {
+		return true
+	}
+	seeker, ok := r.(io.Seeker)
+	if !ok {
+		return false
+	}
+	_, err := seeker.Seek(0, io.SeekStart)
+	return err == nil
+}
+
+// isStaleConnErr reports whether err is consistent with the peer having
+// closed an idle keep-alive connection. Timeouts are explicitly excluded
+// — they reflect a slow upstream, not a stale socket, and must not be
+// retried automatically.
+func isStaleConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "use of closed network connection")
 }
 
 func (c *Client) writeRequest(conn net.Conn, requestID uint16, req Request) error {
@@ -169,7 +244,11 @@ func writeStreamFromReader(w io.Writer, recType uint8, requestID uint16, r io.Re
 	}
 }
 
-func (c *Client) readResponse(conn net.Conn, requestID uint16) (Response, error) {
+// readResponse reads records until the upstream signals end-of-request
+// or fails. The received return value is true once any record has been
+// fully read from conn — after that the response can no longer be
+// retried without risking a duplicate side effect upstream.
+func (c *Client) readResponse(conn net.Conn, requestID uint16) (resp Response, received bool, err error) {
 	const maxPooledBufCap = 1 * 1024 * 1024
 
 	stdout := stdoutBufPool.Get().(*bytes.Buffer)
@@ -197,8 +276,9 @@ func (c *Client) readResponse(conn net.Conn, requestID uint16) (Response, error)
 		rec, err := ReadRecordInto(conn, stdout, stderr, maxResponseBody, maxResponseStderr)
 		if err != nil {
 			returnBufs()
-			return Response{}, err
+			return Response{}, received, err
 		}
+		received = true
 
 		if rec.Header.RequestID != requestID {
 			continue
@@ -207,7 +287,7 @@ func (c *Client) readResponse(conn net.Conn, requestID uint16) (Response, error)
 		if rec.Header.Type == TypeEndRequest {
 			if len(rec.Content) >= 5 && rec.Content[4] != StatusRequestComplete {
 				returnBufs()
-				return Response{}, fmt.Errorf("fcgi: upstream refused request (protocol status %d)", rec.Content[4])
+				return Response{}, received, fmt.Errorf("fcgi: upstream refused request (protocol status %d)", rec.Content[4])
 			}
 
 			// Parse directly from the buffer bytes. parseHTTPResponse does not
@@ -215,7 +295,7 @@ func (c *Client) readResponse(conn net.Conn, requestID uint16) (Response, error)
 			// so we can return the buffers to the pool after parsing.
 			resp, parseErr := parseHTTPResponse(stdout.Bytes(), stderr.Bytes())
 			returnBufs()
-			return resp, parseErr
+			return resp, received, parseErr
 		}
 	}
 }
