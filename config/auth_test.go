@@ -132,7 +132,8 @@ func TestParse_Auth_Invalid(t *testing.T) {
 		name  string
 		mutate func(*AuthConfig)
 	}{
-		{"bad type", func(c *AuthConfig) { c.Type = "basic" }},
+		{"basic type with digest credentials", func(c *AuthConfig) { c.Type = "basic" }},
+		{"bad type", func(c *AuthConfig) { c.Type = "bearer" }},
 		{"empty realm", func(c *AuthConfig) { c.Realm = "" }},
 		{"realm with quote", func(c *AuthConfig) { c.Realm = `a"b` }},
 		{"realm with CRLF", func(c *AuthConfig) { c.Realm = "a\r\nb" }},

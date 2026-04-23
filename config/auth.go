@@ -9,6 +9,8 @@ import (
 	"hash"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 // AuthConfig is the JSON shape for HTTP authentication configuration.
@@ -46,19 +48,33 @@ type ParsedAuth struct {
 	Enabled bool
 	Type    string // AuthTypeDigest or AuthTypeBasic
 	Realm   string
+	// RealmBytes is the realm pre-encoded as []byte so hot-path comparisons
+	// avoid re-allocating on every request.
+	RealmBytes []byte
 	// Users maps username → credential bytes. For digest, the value is the
 	// raw HA1 (hex-decoded). For basic, it is the raw bcrypt hash bytes.
 	// The map is built once at parse time and treated read-only at request time.
 	Users map[string][]byte
 	// Digest-only fields. Zero-valued when Type == AuthTypeBasic.
-	AlgorithmName string           // "SHA-256" or "MD5"
-	HashNew       func() hash.Hash // constructor for the digest algorithm
-	HashHexSize   int              // 32 (MD5) or 64 (SHA-256)
-	NonceLifetime time.Duration
+	AlgorithmName      string           // "SHA-256" or "MD5"
+	AlgorithmNameBytes []byte           // pre-encoded for zero-alloc compare
+	HashNew            func() hash.Hash // constructor for the digest algorithm
+	HashHexSize        int              // 32 (MD5) or 64 (SHA-256)
+	NonceLifetime      time.Duration
 	// NonceSecret is a 32-byte random key used to HMAC-sign stateless nonces.
 	// Regenerated on every process start; clients with an outdated nonce
 	// receive a stale=true challenge and re-authenticate transparently.
 	NonceSecret []byte
+	// DummyHA1 is a fixed-size sentinel used by the digest middleware to run
+	// a hash against on the unknown-user path, equalizing timing so response
+	// latency does not leak user existence.
+	DummyHA1 []byte
+	// Basic-only fields. Zero-valued when Type == AuthTypeDigest.
+	// DummyBcrypt is a bcrypt hash generated at the SAME cost as the most
+	// expensive operator-supplied hash, so a bcrypt.CompareHashAndPassword
+	// call on an unknown user takes the same wall-clock time as one on a real
+	// user with a wrong password. Prevents enumeration via timing.
+	DummyBcrypt []byte
 }
 
 const (
@@ -153,16 +169,24 @@ func parseDigestAuth(c AuthConfig, realm string) (ParsedAuth, error) {
 		return ParsedAuth{}, fmt.Errorf("config: generate auth nonce secret: %w", err)
 	}
 
+	// DummyHA1 for timing equalization on the unknown-user path. Must be the
+	// same length as a real HA1 (the raw hash output size, not hex). MD5 = 16,
+	// SHA-256 = 32. Contents don't matter — only the shape drives hashing cost.
+	dummyHA1 := make([]byte, hashHex/2)
+
 	return ParsedAuth{
-		Enabled:       true,
-		Type:          AuthTypeDigest,
-		Realm:         realm,
-		AlgorithmName: algName,
-		HashNew:       hashNew,
-		HashHexSize:   hashHex,
-		NonceLifetime: lifetime,
-		Users:         users,
-		NonceSecret:   secret,
+		Enabled:            true,
+		Type:               AuthTypeDigest,
+		Realm:              realm,
+		RealmBytes:         []byte(realm),
+		AlgorithmName:      algName,
+		AlgorithmNameBytes: []byte(algName),
+		HashNew:            hashNew,
+		HashHexSize:        hashHex,
+		NonceLifetime:      lifetime,
+		Users:              users,
+		NonceSecret:        secret,
+		DummyHA1:           dummyHA1,
 	}, nil
 }
 
@@ -175,6 +199,7 @@ func parseBasicAuth(c AuthConfig, realm string) (ParsedAuth, error) {
 	}
 
 	users := make(map[string][]byte, len(c.Users))
+	maxCost := 0
 	for i, u := range c.Users {
 		username, err := validateAuthUsername(u.Username, i)
 		if err != nil {
@@ -186,21 +211,41 @@ func parseBasicAuth(c AuthConfig, realm string) (ParsedAuth, error) {
 		if u.HA1 != "" {
 			return ParsedAuth{}, fmt.Errorf("config: auth.users[%d].ha1 is for digest auth; use password_hash with basic", i)
 		}
-		hash := strings.TrimSpace(u.PasswordHash)
-		if hash == "" {
+		h := strings.TrimSpace(u.PasswordHash)
+		if h == "" {
 			return ParsedAuth{}, fmt.Errorf("config: auth.users[%d].password_hash must not be empty", i)
 		}
-		if !isBcryptHash(hash) {
+		if !isBcryptHash(h) {
 			return ParsedAuth{}, fmt.Errorf("config: auth.users[%d].password_hash must be a bcrypt hash (starts with $2a$, $2b$, or $2y$) — generate with `htpasswd -B -n %s`", i, username)
 		}
-		users[username] = []byte(hash)
+		hashBytes := []byte(h)
+		cost, costErr := bcrypt.Cost(hashBytes)
+		if costErr != nil {
+			return ParsedAuth{}, fmt.Errorf("config: auth.users[%d].password_hash is malformed bcrypt: %w", i, costErr)
+		}
+		if cost > maxCost {
+			maxCost = cost
+		}
+		users[username] = hashBytes
+	}
+
+	// Generate the timing-equalizer dummy at the SAME cost as the slowest
+	// operator hash. An unknown-user bcrypt compare therefore takes the same
+	// wall-clock time as a wrong-password compare on the most-expensive real
+	// user, closing the enumeration side channel. Cost 10 ≈ 50ms; cost 14 ≈ 1s.
+	// One-shot at process start, so the cost is paid once at config load.
+	dummy, err := bcrypt.GenerateFromPassword([]byte("x"), maxCost)
+	if err != nil {
+		return ParsedAuth{}, fmt.Errorf("config: generate dummy bcrypt at cost %d: %w", maxCost, err)
 	}
 
 	return ParsedAuth{
-		Enabled: true,
-		Type:    AuthTypeBasic,
-		Realm:   realm,
-		Users:   users,
+		Enabled:     true,
+		Type:        AuthTypeBasic,
+		Realm:       realm,
+		RealmBytes:  []byte(realm),
+		Users:       users,
+		DummyBcrypt: dummy,
 	}, nil
 }
 

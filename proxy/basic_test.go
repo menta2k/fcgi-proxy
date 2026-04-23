@@ -187,29 +187,69 @@ func TestBasicAuth_OversizedHeader(t *testing.T) {
 	}
 }
 
-// TestBasicAuth_UnknownUserTimingEqualized asserts the dummy-bcrypt path
-// runs (correctness, not statistical timing): the function must still return
-// false with a 401.
-func TestBasicAuth_UnknownUserDoesNotLeakViaShortCircuit(t *testing.T) {
-	cfg := buildBasicAuth(t, "r", "alice", "s3cret")
-	// Measure an unknown-user call and a wrong-password call should both
-	// perform a bcrypt compare. We don't assert specific timing; just that
-	// both take non-trivially the same order of magnitude.
-	start := time.Now()
-	ctx := newAuthCtx("GET", "/", basicHeader("mallory", "whatever"))
-	authenticate(ctx, cfg)
-	unknown := time.Since(start)
+// TestBasicAuth_DummyBcryptCostMatchesMaxUserCost is the deterministic
+// replacement for the old timing-smoke test: we assert the dummy hash was
+// generated at the same cost as the highest-cost real user hash. That is
+// the mechanism by which an unknown-user compare takes the same time as a
+// wrong-password compare against the slowest real user.
+func TestBasicAuth_DummyBcryptCostMatchesMaxUserCost(t *testing.T) {
+	// MinCost keeps the test fast; the contract is that whatever the
+	// operator's real hash cost is, the dummy matches it.
+	realHash := bcryptHash(t, "s3cret") // generated at bcrypt.MinCost
+	cfg := config.DefaultConfig()
+	cfg.Auth = config.AuthConfig{
+		Enabled: true,
+		Type:    "basic",
+		Realm:   "r",
+		Users:   []config.AuthUser{{Username: "alice", PasswordHash: realHash}},
+	}
+	parsed, err := config.Parse(cfg)
+	if err != nil {
+		t.Fatalf("config.Parse: %v", err)
+	}
+	realCost, err := bcrypt.Cost([]byte(realHash))
+	if err != nil {
+		t.Fatalf("bcrypt.Cost real: %v", err)
+	}
+	dummyCost, err := bcrypt.Cost(parsed.Auth.DummyBcrypt)
+	if err != nil {
+		t.Fatalf("bcrypt.Cost dummy: %v", err)
+	}
+	if dummyCost != realCost {
+		t.Errorf("dummy bcrypt cost = %d, want %d (max user cost)", dummyCost, realCost)
+	}
+}
 
-	start = time.Now()
-	ctx = newAuthCtx("GET", "/", basicHeader("alice", "wrongpassword"))
-	authenticate(ctx, cfg)
-	wrong := time.Since(start)
-
-	// Both paths must run bcrypt (minimum bcrypt MinCost ~1ms). If the
-	// unknown path is orders of magnitude faster, we've regressed the
-	// timing-equalizer.
-	if unknown < wrong/10 || unknown > wrong*10 {
-		t.Logf("warning: unknown=%v wrong=%v — large divergence; bcrypt equalizer may have regressed (non-deterministic; informational only)", unknown, wrong)
+// With two user hashes at different costs, the dummy must match the MAX.
+func TestBasicAuth_DummyBcryptCostMatchesMax(t *testing.T) {
+	low, err := bcrypt.GenerateFromPassword([]byte("a"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("bcrypt.GenerateFromPassword low: %v", err)
+	}
+	high, err := bcrypt.GenerateFromPassword([]byte("b"), bcrypt.MinCost+2)
+	if err != nil {
+		t.Fatalf("bcrypt.GenerateFromPassword high: %v", err)
+	}
+	cfg := config.DefaultConfig()
+	cfg.Auth = config.AuthConfig{
+		Enabled: true,
+		Type:    "basic",
+		Realm:   "r",
+		Users: []config.AuthUser{
+			{Username: "alice", PasswordHash: string(low)},
+			{Username: "bob", PasswordHash: string(high)},
+		},
+	}
+	parsed, err := config.Parse(cfg)
+	if err != nil {
+		t.Fatalf("config.Parse: %v", err)
+	}
+	got, err := bcrypt.Cost(parsed.Auth.DummyBcrypt)
+	if err != nil {
+		t.Fatalf("bcrypt.Cost: %v", err)
+	}
+	if got != bcrypt.MinCost+2 {
+		t.Errorf("dummy cost = %d, want %d (max of configured hashes)", got, bcrypt.MinCost+2)
 	}
 }
 

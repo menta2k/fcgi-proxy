@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -36,6 +37,10 @@ type digestParams struct {
 //
 // The parser recognizes: key=value and key="value" (with backslash-escaped
 // double quotes inside the quoted form). Unknown keys are silently skipped.
+// Leading/trailing whitespace around the key is tolerated so that
+// "username =..." is accepted even though RFC 7235 does not require it.
+// Values containing backslash escapes are unescaped into a fresh slice —
+// well-formed headers (the vast majority) stay zero-alloc.
 func parseDigestHeader(b []byte) (digestParams, bool) {
 	var p digestParams
 	i := 0
@@ -57,6 +62,10 @@ func parseDigestHeader(b []byte) (digestParams, bool) {
 			return digestParams{}, false
 		}
 		key := b[keyStart:i]
+		// Trim trailing whitespace so "key =value" parses the same as "key=value".
+		for len(key) > 0 && (key[len(key)-1] == ' ' || key[len(key)-1] == '\t') {
+			key = key[:len(key)-1]
+		}
 		i++ // consume '='
 
 		// Read value: quoted or bare.
@@ -64,8 +73,10 @@ func parseDigestHeader(b []byte) (digestParams, bool) {
 		if i < n && b[i] == '"' {
 			i++ // consume opening quote
 			valStart := i
+			escaped := false
 			for i < n && b[i] != '"' {
 				if b[i] == '\\' && i+1 < n {
+					escaped = true
 					i += 2
 					continue
 				}
@@ -74,7 +85,12 @@ func parseDigestHeader(b []byte) (digestParams, bool) {
 			if i >= n {
 				return digestParams{}, false
 			}
-			val = b[valStart:i]
+			raw := b[valStart:i]
+			if escaped {
+				val = unescapeQuotedString(raw)
+			} else {
+				val = raw
+			}
 			i++ // consume closing quote
 		} else {
 			valStart := i
@@ -87,6 +103,22 @@ func parseDigestHeader(b []byte) (digestParams, bool) {
 		assignDigestField(&p, key, val)
 	}
 	return p, true
+}
+
+// unescapeQuotedString returns s with each `\X` two-byte escape replaced by
+// the single byte X. Allocates once per call — only invoked when the parser
+// actually saw a backslash inside the quoted value, which is rare.
+func unescapeQuotedString(s []byte) []byte {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			out = append(out, s[i+1])
+			i++
+			continue
+		}
+		out = append(out, s[i])
+	}
+	return out
 }
 
 func assignDigestField(p *digestParams, key, val []byte) {
@@ -215,9 +247,32 @@ func authenticateDigest(ctx *fasthttp.RequestCtx, cfg config.ParsedAuth) bool {
 		sendAuthChallenge(ctx, cfg, false)
 		return false
 	}
-	// Realm must match so credentials prepared for another realm cannot be
-	// replayed against us.
-	if !bytesEqualString(params.Realm, cfg.Realm) {
+	// Realm must match. Constant-time compare: public value, so a timing
+	// leak here is harmless, but consistency with the response compare is
+	// cleaner and future-proof.
+	if len(params.Realm) != len(cfg.RealmBytes) ||
+		subtle.ConstantTimeCompare(params.Realm, cfg.RealmBytes) != 1 {
+		sendAuthChallenge(ctx, cfg, false)
+		return false
+	}
+	// If the client echoed an algorithm, it must match the one we advertised.
+	// Silently accepting a mismatch would be a downgrade hazard if a future
+	// refactor ever used params.Algorithm to select the hash function.
+	if len(params.Algorithm) > 0 && !byteEqualFold(params.Algorithm, cfg.AlgorithmName) {
+		sendAuthChallenge(ctx, cfg, false)
+		return false
+	}
+	// Require qop=auth. Our challenge always advertises it, and accepting a
+	// qop-absent response would let an MitM strip qop and force the legacy
+	// RFC 2069 formula that lacks cnonce/nc mixing.
+	if !byteEqualFold(params.QoP, "auth") {
+		sendAuthChallenge(ctx, cfg, false)
+		return false
+	}
+	// The uri= parameter must match the actual request target (RFC 7616 §3.4).
+	// Without this check, a captured Authorization header can be replayed
+	// against a different URI within the nonce lifetime.
+	if !bytes.Equal(params.URI, ctx.RequestURI()) {
 		sendAuthChallenge(ctx, cfg, false)
 		return false
 	}
@@ -229,8 +284,15 @@ func authenticateDigest(ctx *fasthttp.RequestCtx, cfg config.ParsedAuth) bool {
 	}
 	// Username is the map key. A string conversion via m[string(bytes)] is
 	// compiler-optimized to zero-alloc for map lookups.
-	ha1, ok := cfg.Users[string(params.Username)]
-	if !ok {
+	ha1, userOK := cfg.Users[string(params.Username)]
+	if !userOK {
+		// Equalize timing with the known-user-wrong-password path by running
+		// the same hashing work against a sentinel HA1. Prevents user
+		// enumeration via response-time analysis. The compare always fails
+		// by construction — DummyHA1 is never a real credential — but
+		// constant-time keeps the branch indistinguishable.
+		dummy := computeDigestResponse(cfg, cfg.DummyHA1, params, ctx.Method())
+		_ = subtle.ConstantTimeCompare(dummy, params.Response)
 		sendAuthChallenge(ctx, cfg, false)
 		return false
 	}
@@ -245,13 +307,14 @@ func authenticateDigest(ctx *fasthttp.RequestCtx, cfg config.ParsedAuth) bool {
 }
 
 // computeDigestResponse computes the expected response digest for RFC 7616
-// qop="auth". Returns the raw digest bytes (not hex).
+// qop="auth". Returns the HEX-encoded digest, matching the format the client
+// sends in the `response=` field so a constant-time compare works directly.
 //
 //	HA2      = H(method:digestURI)
 //	response = H(HA1:nonce:nc:cnonce:qop:HA2)
 //
-// When qop is absent (legacy RFC 2069) the response simplifies to
-// H(HA1:nonce:HA2). We support both.
+// Callers must have already validated that QoP == "auth"; this function
+// does not branch on qop content.
 func computeDigestResponse(cfg config.ParsedAuth, ha1 []byte, p digestParams, method []byte) []byte {
 	h := cfg.HashNew()
 
@@ -266,14 +329,12 @@ func computeDigestResponse(cfg config.ParsedAuth, ha1 []byte, p digestParams, me
 	h.Write(ha1Hex)
 	h.Write([]byte{':'})
 	h.Write(p.Nonce)
-	if len(p.QoP) > 0 {
-		h.Write([]byte{':'})
-		h.Write(p.NC)
-		h.Write([]byte{':'})
-		h.Write(p.CNonce)
-		h.Write([]byte{':'})
-		h.Write(p.QoP)
-	}
+	h.Write([]byte{':'})
+	h.Write(p.NC)
+	h.Write([]byte{':'})
+	h.Write(p.CNonce)
+	h.Write([]byte{':'})
+	h.Write(p.QoP)
 	h.Write([]byte{':'})
 	h.Write(ha2Hex)
 
@@ -288,19 +349,6 @@ func hexEncode(b []byte) []byte {
 	out := make([]byte, hex.EncodedLen(len(b)))
 	hex.Encode(out, b)
 	return out
-}
-
-// bytesEqualString compares b to s without a string conversion on b.
-func bytesEqualString(b []byte, s string) bool {
-	if len(b) != len(s) {
-		return false
-	}
-	for i := range len(s) {
-		if b[i] != s[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // sendAuthChallenge writes a 401 response with a fresh WWW-Authenticate

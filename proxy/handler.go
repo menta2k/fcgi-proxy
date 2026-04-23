@@ -162,6 +162,12 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 		// and cached-upstream locations, so anything falling through is bound
 		// for FCGI. Auth is checked here so configured bypasses happen
 		// naturally without per-path list maintenance.
+		//
+		// Intentional ordering: auth runs BEFORE the null-byte URI check
+		// below. An unauthenticated null-byte URI therefore receives 401 (not
+		// 400). Leaking "your request was well-formed but unauthenticated"
+		// information to an anonymous client is safer than leaking validation
+		// details about the request shape.
 		if cfg.Auth.Enabled {
 			if !authenticate(ctx, cfg.Auth) {
 				applyCORSResponseHeaders(ctx, cfg.CORS, corsResult)

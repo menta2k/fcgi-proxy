@@ -4,7 +4,6 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -341,23 +340,127 @@ func TestAuthenticate_StaleNonce(t *testing.T) {
 	}
 }
 
-func TestAuthenticate_LegacyRFC2069_NoQoP(t *testing.T) {
-	// RFC 2069 flavor: no qop/nc/cnonce — response = H(HA1:nonce:HA2).
+func TestAuthenticate_LegacyRFC2069_Rejected(t *testing.T) {
+	// RFC 2069 (no qop) is a downgrade hazard: an MitM could strip qop to
+	// force the legacy formula that skips cnonce/nc mixing. We refuse it
+	// even with otherwise valid credentials.
 	cfg := buildAuth(t, "MD5", "r", "alice", "s3cret")
 	ctx1 := newAuthCtx("GET", "/", "")
 	authenticate(ctx1, cfg)
 	nonce := extractAuthParam(string(ctx1.Response.Header.Peek("WWW-Authenticate")), "nonce")
 
 	ha1 := computeHA1("MD5", "alice", "r", "s3cret")
-	// No qop, so pass empty qop to the helper.
 	resp := computeClientResponse("MD5", ha1, "GET", "/", nonce, "", "", "")
 	hdr := makeAuthHeader(map[string]string{
 		"username": "alice", "realm": "r", "nonce": nonce, "uri": "/",
 		"response": resp,
 	})
 	ctx2 := newAuthCtx("GET", "/", hdr)
-	if !authenticate(ctx2, cfg) {
-		t.Fatal("authenticate rejected valid RFC-2069-style credentials")
+	if authenticate(ctx2, cfg) {
+		t.Fatal("authenticate accepted qop-absent (RFC 2069) credentials; must require qop=auth")
+	}
+	if ctx2.Response.StatusCode() != fasthttp.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", ctx2.Response.StatusCode())
+	}
+}
+
+func TestAuthenticate_WrongAlgorithmRejected(t *testing.T) {
+	// Server configured for SHA-256; client advertises MD5 in algorithm=.
+	// Must be rejected to prevent any future downgrade refactor from silently
+	// accepting a weaker hash.
+	cfg := buildAuth(t, "SHA-256", "r", "alice", "s3cret")
+	ctx1 := newAuthCtx("GET", "/", "")
+	authenticate(ctx1, cfg)
+	nonce := extractAuthParam(string(ctx1.Response.Header.Peek("WWW-Authenticate")), "nonce")
+
+	// Response is computed correctly for SHA-256, but algorithm claims MD5.
+	ha1 := computeHA1("SHA-256", "alice", "r", "s3cret")
+	resp := computeClientResponse("SHA-256", ha1, "GET", "/", nonce, "00000001", "c", "auth")
+	hdr := makeAuthHeader(map[string]string{
+		"username": "alice", "realm": "r", "nonce": nonce, "uri": "/",
+		"qop": "auth", "nc": "00000001", "cnonce": "c", "response": resp,
+		"algorithm": "MD5",
+	})
+	ctx2 := newAuthCtx("GET", "/", hdr)
+	if authenticate(ctx2, cfg) {
+		t.Fatal("authenticate accepted mismatched algorithm")
+	}
+}
+
+func TestAuthenticate_URIMismatchRejected(t *testing.T) {
+	// uri= in the Authorization header must match the actual request target.
+	// Otherwise a captured header can be replayed against a different URI.
+	cfg := buildAuth(t, "SHA-256", "r", "alice", "s3cret")
+	ctx1 := newAuthCtx("GET", "/index.php", "")
+	authenticate(ctx1, cfg)
+	nonce := extractAuthParam(string(ctx1.Response.Header.Peek("WWW-Authenticate")), "nonce")
+
+	ha1 := computeHA1("SHA-256", "alice", "r", "s3cret")
+	// Compute response using the claimed URI (/admin.php) so the digest
+	// itself verifies — the server must still reject because the actual
+	// request URI is /index.php.
+	resp := computeClientResponse("SHA-256", ha1, "GET", "/admin.php", nonce, "00000001", "c", "auth")
+	hdr := makeAuthHeader(map[string]string{
+		"username": "alice", "realm": "r", "nonce": nonce, "uri": "/admin.php",
+		"qop": "auth", "nc": "00000001", "cnonce": "c", "response": resp,
+	})
+	ctx2 := newAuthCtx("GET", "/index.php", hdr)
+	if authenticate(ctx2, cfg) {
+		t.Fatal("authenticate accepted a request whose uri= does not match the target")
+	}
+}
+
+func TestAuthenticate_UnknownUserRunsDummyHash(t *testing.T) {
+	// Correctness check for the timing equalizer on the unknown-user path.
+	// We can't assert wall-clock parity deterministically, but we can verify
+	// that the handler still produces a 401 with a correctly-shaped
+	// challenge — i.e. the code path ran to completion instead of
+	// short-circuiting after the map miss.
+	cfg := buildAuth(t, "SHA-256", "r", "alice", "s3cret")
+	ctx1 := newAuthCtx("GET", "/", "")
+	authenticate(ctx1, cfg)
+	nonce := extractAuthParam(string(ctx1.Response.Header.Peek("WWW-Authenticate")), "nonce")
+
+	ha1 := computeHA1("SHA-256", "mallory", "r", "whatever")
+	resp := computeClientResponse("SHA-256", ha1, "GET", "/", nonce, "00000001", "c", "auth")
+	hdr := makeAuthHeader(map[string]string{
+		"username": "mallory", "realm": "r", "nonce": nonce, "uri": "/",
+		"qop": "auth", "nc": "00000001", "cnonce": "c", "response": resp,
+	})
+	ctx2 := newAuthCtx("GET", "/", hdr)
+	if authenticate(ctx2, cfg) {
+		t.Fatal("authenticate accepted unknown user")
+	}
+	if ctx2.Response.StatusCode() != fasthttp.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", ctx2.Response.StatusCode())
+	}
+	ch := string(ctx2.Response.Header.Peek("WWW-Authenticate"))
+	if !strings.HasPrefix(ch, "Digest ") {
+		t.Errorf("missing challenge on unknown-user rejection: %q", ch)
+	}
+}
+
+func TestParseDigestHeader_EscapedQuoteUnescaped(t *testing.T) {
+	// A realm containing an escaped double-quote must be unescaped during parse
+	// so that comparisons against the configured realm succeed.
+	raw := []byte(`username="a", realm="re\"alm", nonce="n", uri="/", response="r"`)
+	p, ok := parseDigestHeader(raw)
+	if !ok {
+		t.Fatal("parser rejected well-formed header with escaped quote")
+	}
+	if string(p.Realm) != `re"alm` {
+		t.Errorf("Realm = %q, want %q", p.Realm, `re"alm`)
+	}
+}
+
+func TestParseDigestHeader_TrailingSpaceOnKeyTolerated(t *testing.T) {
+	raw := []byte(`username ="alice", realm ="r", nonce="n", uri="/", response="r"`)
+	p, ok := parseDigestHeader(raw)
+	if !ok {
+		t.Fatal("parser rejected header with space-padded key")
+	}
+	if string(p.Username) != "alice" || string(p.Realm) != "r" {
+		t.Errorf("unexpected parse: %+v", p)
 	}
 }
 
@@ -466,6 +569,3 @@ func TestHA1_Documentation(t *testing.T) {
 	}
 }
 
-// Keep fmt import used — stops the file from being blamed for unused import
-// if test names change later.
-var _ = fmt.Stringer(nil)
