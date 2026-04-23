@@ -25,6 +25,30 @@
     "allow_credentials": false,
     "max_age": "10m"
   },
+  "auth": {
+    "enabled": false,
+    "type": "digest",
+    "realm": "fcgi-proxy",
+    "algorithm": "SHA-256",
+    "nonce_lifetime": "5m",
+    "users": [
+      {
+        "username": "alice",
+        "ha1": "REPLACE_WITH_HEX_OF_SHA256_OF_USER_COLON_REALM_COLON_PASSWORD"
+      }
+    ]
+  },
+  "auth_basic_example": {
+    "enabled": false,
+    "type": "basic",
+    "realm": "fcgi-proxy",
+    "users": [
+      {
+        "username": "alice",
+        "password_hash": "$2b$10$REPLACE_WITH_BCRYPT_HASH_FROM_htpasswd_DASH_B_DASH_n_alice"
+      }
+    ]
+  },
   "locations": [
     {
       "path": "/apple-app-site-association",

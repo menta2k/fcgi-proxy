@@ -4,6 +4,7 @@ go 1.25.4
 
 require (
 	github.com/valyala/fasthttp v1.70.0
+	golang.org/x/crypto v0.48.0
 	golang.org/x/sync v0.20.0
 )
 

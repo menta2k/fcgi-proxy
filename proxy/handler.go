@@ -49,6 +49,10 @@ type Config struct {
 	// CORS configures Cross-Origin Resource Sharing. When Enabled is false,
 	// CORS handling is a no-op.
 	CORS config.ParsedCORS
+	// Auth configures HTTP authentication applied before the FCGI dispatch.
+	// Bypasses /healthz, static locations, and cached upstream locations
+	// (they serve before the auth check runs).
+	Auth config.ParsedAuth
 }
 
 // StaticResponse is a materialized inline response served for a configured
@@ -149,6 +153,17 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 		if locCache != nil {
 			if loc, ok := locCache.Match(uriPath); ok {
 				serveLocationCache(ctx, locCache, loc, cfg.ResponseHeaders)
+				applyCORSResponseHeaders(ctx, cfg.CORS, corsResult)
+				return
+			}
+		}
+
+		// Authentication gate: at this point we've exhausted /healthz, static,
+		// and cached-upstream locations, so anything falling through is bound
+		// for FCGI. Auth is checked here so configured bypasses happen
+		// naturally without per-path list maintenance.
+		if cfg.Auth.Enabled {
+			if !authenticate(ctx, cfg.Auth) {
 				applyCORSResponseHeaders(ctx, cfg.CORS, corsResult)
 				return
 			}

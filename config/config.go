@@ -28,6 +28,7 @@ type Config struct {
 	ResponseHeaders map[string]string `json:"response_headers"`
 	Locations       []LocationConfig  `json:"locations"`
 	CORS            CORSConfig        `json:"cors"`
+	Auth            AuthConfig        `json:"auth"`
 }
 
 // CORSConfig defines Cross-Origin Resource Sharing rules.
@@ -94,6 +95,7 @@ type Parsed struct {
 	ResponseHeaders map[string]string
 	Locations       []ParsedLocation
 	CORS            ParsedCORS
+	Auth            ParsedAuth
 }
 
 // ParsedCORS holds validated CORS settings with pre-built header values.
@@ -291,6 +293,11 @@ func Parse(cfg Config) (Parsed, error) {
 		return Parsed{}, err
 	}
 
+	parsedAuth, err := parseAuth(cfg.Auth)
+	if err != nil {
+		return Parsed{}, err
+	}
+
 	// Prevent silent conflict between the generic response_headers injector and
 	// the CORS middleware. When both are configured, the middleware overwrites
 	// any overlapping Access-Control-* header from response_headers, which
@@ -319,6 +326,7 @@ func Parse(cfg Config) (Parsed, error) {
 		ResponseHeaders: cfg.ResponseHeaders,
 		Locations:       parsedLocations,
 		CORS:            parsedCORS,
+		Auth:            parsedAuth,
 	}, nil
 }
 
