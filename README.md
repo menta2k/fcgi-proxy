@@ -145,7 +145,7 @@ Copy `config.example.json` to `config.json` and edit as needed.
 | Pool max idle | `pool_max_idle` | - | `32` | Maximum idle connections kept in the FastCGI connection pool (1 to 1024) |
 | Pool idle timeout | `pool_idle_timeout` | - | `30s` | How long an idle connection can sit unused before being closed (1s to 5m) |
 | Response headers | `response_headers` | - | `{}` | Map of headers added to every response (see below) |
-| Locations | `locations` | - | `[]` | External proxy locations with caching (see below) |
+| Locations | `locations` | - | `[]` | Per-path rules — cached upstream proxies AND inline static returns (see [Locations](#locations)) |
 | CORS | `cors` | - | `{"enabled": false}` | Cross-Origin Resource Sharing config (see [CORS](#cors)) |
 | Authentication | `auth` | - | `{"enabled": false}` | HTTP Digest or Basic authentication (see [Authentication](#authentication)) |
 
@@ -167,9 +167,11 @@ Header names must contain only alphanumeric characters and hyphens. Values must 
 
 Note: response headers are **not** applied to `/healthz` responses (health checks go to load balancers, not browsers).
 
-### Location Cache
+### Locations
 
-Proxy specific paths to external HTTP/HTTPS servers and cache the response. This is useful for serving static content from a CDN or external asset server without routing through PHP-FPM.
+The `locations[]` array defines per-path rules that run before the FastCGI dispatch. Each entry must set **either** `upstream` (cached reverse proxy to an external HTTP server) **or** `return` (inline static response) — never both, never neither. Up to 100 entries total. Path matching is exact (after fasthttp URI normalization) — `/foo` does not match `/foo/bar`.
+
+Locations are evaluated **after** CORS preflight / healthz and **before** the auth gate, so configured paths bypass authentication by design — if you need auth on a location, remove it from `locations[]` and handle it through the backend instead.
 
 ```json
 {
@@ -180,18 +182,25 @@ Proxy specific paths to external HTTP/HTTPS servers and cache the response. This
       "cache_ttl": "1h"
     },
     {
-      "path": "/.well-known/assetlinks.json",
-      "upstream": "https://assets.example.com/android/assetlinks.json",
-      "cache_ttl": "1h"
+      "path": "/robots.txt",
+      "return": {
+        "status": 200,
+        "body": "User-agent: *\nDisallow:",
+        "content_type": "text/plain"
+      }
     }
   ]
 }
 ```
 
+#### Cached upstream
+
+Proxy specific paths to external HTTP/HTTPS servers and cache the response. Useful for serving static assets from a CDN or a different origin without routing through PHP-FPM.
+
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `path` | yes | - | Exact path to match (must start with `/`) |
-| `upstream` | yes | - | External URL to fetch from (`http://` or `https://`) |
+| `path` | yes | — | Exact path to match (must start with `/`) |
+| `upstream` | yes | — | External URL to fetch from (`http://` or `https://`) |
 | `cache_ttl` | no | `5m` | How long to cache a successful (200) response. Go duration format. |
 
 **Behavior:**
@@ -201,7 +210,6 @@ Proxy specific paths to external HTTP/HTTPS servers and cache the response. This
 - When the upstream is unreachable, a previously cached 200 response is served as a stale fallback (up to 24 hours old). Stale entries older than 24 hours are evicted from memory.
 - Each cached response body is capped at 10 MB.
 - Responses include an `X-Cache: HIT` or `X-Cache: MISS` header.
-- Maximum 100 locations can be configured.
 
 **Security:**
 
@@ -209,6 +217,62 @@ Proxy specific paths to external HTTP/HTTPS servers and cache the response. This
 - Redirects are limited to 5 hops per request, and the SSRF guard applies at the TCP dial layer so redirects to internal addresses are also blocked.
 - Upstream URLs must not contain credentials (`user:pass@host` is rejected at config validation).
 - Error messages in logs have credentials stripped from URLs.
+
+#### Static return
+
+Serve a constant response for a path with no upstream call at all — the nginx `location { return 200 '...'; }` equivalent. Typical use cases: `/robots.txt`, `/ads.txt`, `/.well-known/security.txt`, a synthetic `/version` endpoint, or a maintenance-mode override.
+
+```json
+{
+  "locations": [
+    {
+      "path": "/robots.txt",
+      "return": {
+        "status": 200,
+        "body": "Sitemap: https://www.example.com/sitemap.xml\nUser-agent: *\nDisallow:",
+        "content_type": "text/plain"
+      }
+    },
+    {
+      "path": "/favicon.ico",
+      "return": {
+        "status": 204,
+        "body": ""
+      }
+    },
+    {
+      "path": "/.well-known/security.txt",
+      "return": {
+        "status": 200,
+        "body": "Contact: mailto:security@example.com\nExpires: 2027-01-01T00:00:00Z",
+        "content_type": "text/plain; charset=utf-8"
+      }
+    }
+  ]
+}
+```
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `path` | yes | — | Exact path to match (must start with `/`) |
+| `return.status` | no | `200` | HTTP status code. Must be between `100` and `599`. |
+| `return.body` | yes | — | Response body. Maximum **64 KiB**; anything larger belongs on a real upstream. May be empty (e.g. `204 No Content`). |
+| `return.content_type` | no | `text/plain; charset=utf-8` | `Content-Type` header value. Must not contain CR, LF, or NUL. |
+| `cache_ttl` | — | — | **Rejected at config load** when `return` is set — no cache is involved. |
+
+**Behavior:**
+
+- Body bytes are materialized once at config parse time; the request hot path calls `SetBody` on the pre-allocated `[]byte` — **zero upstream calls, zero hot-path allocations** beyond what fasthttp's own response serialization needs (~5 allocs/req).
+- Configured `response_headers` and CORS headers still apply to the static response.
+- Static entries win over upstream entries that share the same path (though duplicate paths are rejected at config load regardless).
+
+**Validation:**
+
+- `return` and `upstream` are mutually exclusive per entry. Setting both or neither fails at startup.
+- `return.body` larger than 64 KiB is rejected — move that payload to an `upstream` entry instead.
+- `return.content_type` with CR/LF/NUL is rejected (header-injection defense).
+- `cache_ttl` on a `return` entry is rejected (the field is meaningless — the body is already resident in memory and never expires).
+- Duplicate paths across `locations[]` are rejected, regardless of variant.
 
 ### CORS
 
