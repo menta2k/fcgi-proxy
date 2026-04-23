@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/base64"
+	"time"
 
 	"github.com/menta2k/fcgi-proxy/config"
 	"github.com/valyala/fasthttp"
@@ -9,8 +10,10 @@ import (
 )
 
 // authenticateBasic validates an incoming Basic Authorization header.
-// On failure it writes a 401 challenge and returns false.
-func authenticateBasic(ctx *fasthttp.RequestCtx, cfg config.ParsedAuth) bool {
+// On failure it writes a 401 challenge and returns false. When cache is
+// non-nil, a previously-successful (hash, password) pair within the TTL
+// window skips the bcrypt verification entirely.
+func authenticateBasic(ctx *fasthttp.RequestCtx, cfg config.ParsedAuth, cache *passwordCache) bool {
 	auth := ctx.Request.Header.Peek("Authorization")
 	if len(auth) < 7 || !byteEqualFold(auth[:5], "basic") || auth[5] != ' ' {
 		sendBasicChallenge(ctx, cfg)
@@ -60,11 +63,25 @@ func authenticateBasic(ctx *fasthttp.RequestCtx, cfg config.ParsedAuth) bool {
 		return false
 	}
 
+	// Fast path: recently-verified credentials skip the bcrypt compare.
+	// Only successful outcomes are cached, so a cache hit is proof of a
+	// prior full verification against this exact stored hash.
+	var key [32]byte
+	if cache != nil {
+		key = cacheKey(hash, password)
+		if cache.check(key, time.Now()) {
+			return true
+		}
+	}
+
 	if err := bcrypt.CompareHashAndPassword(hash, password); err != nil {
 		sendBasicChallenge(ctx, cfg)
 		return false
 	}
 
+	if cache != nil {
+		cache.set(key, time.Now())
+	}
 	return true
 }
 

@@ -214,7 +214,7 @@ func TestNonce_BadBase64(t *testing.T) {
 func TestAuthenticate_NoAuthHeader_SendsChallenge(t *testing.T) {
 	cfg := buildAuth(t, "SHA-256", "r", "alice", "s3cret")
 	ctx := newAuthCtx("GET", "/index.php", "")
-	if authenticate(ctx, cfg) {
+	if authenticate(ctx, cfg, nil) {
 		t.Fatal("authenticate should return false for missing header")
 	}
 	if ctx.Response.StatusCode() != fasthttp.StatusUnauthorized {
@@ -233,7 +233,7 @@ func TestAuthenticate_ValidCredentials(t *testing.T) {
 	cfg := buildAuth(t, "SHA-256", "r", "alice", "s3cret")
 	// Produce a real challenge to extract a server-signed nonce.
 	ctx1 := newAuthCtx("GET", "/index.php", "")
-	authenticate(ctx1, cfg)
+	authenticate(ctx1, cfg, nil)
 	ch := string(ctx1.Response.Header.Peek("WWW-Authenticate"))
 	nonce := extractAuthParam(ch, "nonce")
 	if nonce == "" {
@@ -259,7 +259,7 @@ func TestAuthenticate_ValidCredentials(t *testing.T) {
 		"response": resp,
 	})
 	ctx2 := newAuthCtx(method, uri, hdr)
-	if !authenticate(ctx2, cfg) {
+	if !authenticate(ctx2, cfg, nil) {
 		t.Fatalf("authenticate rejected valid credentials\n  challenge: %s\n  auth: %s", ch, hdr)
 	}
 }
@@ -267,7 +267,7 @@ func TestAuthenticate_ValidCredentials(t *testing.T) {
 func TestAuthenticate_WrongPassword(t *testing.T) {
 	cfg := buildAuth(t, "SHA-256", "r", "alice", "s3cret")
 	ctx1 := newAuthCtx("GET", "/", "")
-	authenticate(ctx1, cfg)
+	authenticate(ctx1, cfg, nil)
 	nonce := extractAuthParam(string(ctx1.Response.Header.Peek("WWW-Authenticate")), "nonce")
 
 	wrongHA1 := computeHA1("SHA-256", "alice", "r", "wrong")
@@ -277,7 +277,7 @@ func TestAuthenticate_WrongPassword(t *testing.T) {
 		"qop": "auth", "nc": "00000001", "cnonce": "c", "response": resp,
 	})
 	ctx2 := newAuthCtx("GET", "/", hdr)
-	if authenticate(ctx2, cfg) {
+	if authenticate(ctx2, cfg, nil) {
 		t.Fatal("authenticate accepted wrong password")
 	}
 }
@@ -285,7 +285,7 @@ func TestAuthenticate_WrongPassword(t *testing.T) {
 func TestAuthenticate_UnknownUser(t *testing.T) {
 	cfg := buildAuth(t, "SHA-256", "r", "alice", "s3cret")
 	ctx1 := newAuthCtx("GET", "/", "")
-	authenticate(ctx1, cfg)
+	authenticate(ctx1, cfg, nil)
 	nonce := extractAuthParam(string(ctx1.Response.Header.Peek("WWW-Authenticate")), "nonce")
 
 	ha1 := computeHA1("SHA-256", "mallory", "r", "anything")
@@ -295,7 +295,7 @@ func TestAuthenticate_UnknownUser(t *testing.T) {
 		"qop": "auth", "nc": "00000001", "cnonce": "c", "response": resp,
 	})
 	ctx2 := newAuthCtx("GET", "/", hdr)
-	if authenticate(ctx2, cfg) {
+	if authenticate(ctx2, cfg, nil) {
 		t.Fatal("authenticate accepted unknown user")
 	}
 }
@@ -303,7 +303,7 @@ func TestAuthenticate_UnknownUser(t *testing.T) {
 func TestAuthenticate_WrongRealm(t *testing.T) {
 	cfg := buildAuth(t, "SHA-256", "r", "alice", "s3cret")
 	ctx1 := newAuthCtx("GET", "/", "")
-	authenticate(ctx1, cfg)
+	authenticate(ctx1, cfg, nil)
 	nonce := extractAuthParam(string(ctx1.Response.Header.Peek("WWW-Authenticate")), "nonce")
 
 	ha1 := computeHA1("SHA-256", "alice", "r", "s3cret")
@@ -313,7 +313,7 @@ func TestAuthenticate_WrongRealm(t *testing.T) {
 		"qop": "auth", "nc": "00000001", "cnonce": "c", "response": resp,
 	})
 	ctx2 := newAuthCtx("GET", "/", hdr)
-	if authenticate(ctx2, cfg) {
+	if authenticate(ctx2, cfg, nil) {
 		t.Fatal("authenticate accepted mismatched realm")
 	}
 }
@@ -331,7 +331,7 @@ func TestAuthenticate_StaleNonce(t *testing.T) {
 		"qop": "auth", "nc": "00000001", "cnonce": "c", "response": resp,
 	})
 	ctx := newAuthCtx("GET", "/", hdr)
-	if authenticate(ctx, cfg) {
+	if authenticate(ctx, cfg, nil) {
 		t.Fatal("authenticate accepted stale nonce")
 	}
 	ch := string(ctx.Response.Header.Peek("WWW-Authenticate"))
@@ -346,7 +346,7 @@ func TestAuthenticate_LegacyRFC2069_Rejected(t *testing.T) {
 	// even with otherwise valid credentials.
 	cfg := buildAuth(t, "MD5", "r", "alice", "s3cret")
 	ctx1 := newAuthCtx("GET", "/", "")
-	authenticate(ctx1, cfg)
+	authenticate(ctx1, cfg, nil)
 	nonce := extractAuthParam(string(ctx1.Response.Header.Peek("WWW-Authenticate")), "nonce")
 
 	ha1 := computeHA1("MD5", "alice", "r", "s3cret")
@@ -356,7 +356,7 @@ func TestAuthenticate_LegacyRFC2069_Rejected(t *testing.T) {
 		"response": resp,
 	})
 	ctx2 := newAuthCtx("GET", "/", hdr)
-	if authenticate(ctx2, cfg) {
+	if authenticate(ctx2, cfg, nil) {
 		t.Fatal("authenticate accepted qop-absent (RFC 2069) credentials; must require qop=auth")
 	}
 	if ctx2.Response.StatusCode() != fasthttp.StatusUnauthorized {
@@ -370,7 +370,7 @@ func TestAuthenticate_WrongAlgorithmRejected(t *testing.T) {
 	// accepting a weaker hash.
 	cfg := buildAuth(t, "SHA-256", "r", "alice", "s3cret")
 	ctx1 := newAuthCtx("GET", "/", "")
-	authenticate(ctx1, cfg)
+	authenticate(ctx1, cfg, nil)
 	nonce := extractAuthParam(string(ctx1.Response.Header.Peek("WWW-Authenticate")), "nonce")
 
 	// Response is computed correctly for SHA-256, but algorithm claims MD5.
@@ -382,7 +382,7 @@ func TestAuthenticate_WrongAlgorithmRejected(t *testing.T) {
 		"algorithm": "MD5",
 	})
 	ctx2 := newAuthCtx("GET", "/", hdr)
-	if authenticate(ctx2, cfg) {
+	if authenticate(ctx2, cfg, nil) {
 		t.Fatal("authenticate accepted mismatched algorithm")
 	}
 }
@@ -392,7 +392,7 @@ func TestAuthenticate_URIMismatchRejected(t *testing.T) {
 	// Otherwise a captured header can be replayed against a different URI.
 	cfg := buildAuth(t, "SHA-256", "r", "alice", "s3cret")
 	ctx1 := newAuthCtx("GET", "/index.php", "")
-	authenticate(ctx1, cfg)
+	authenticate(ctx1, cfg, nil)
 	nonce := extractAuthParam(string(ctx1.Response.Header.Peek("WWW-Authenticate")), "nonce")
 
 	ha1 := computeHA1("SHA-256", "alice", "r", "s3cret")
@@ -405,7 +405,7 @@ func TestAuthenticate_URIMismatchRejected(t *testing.T) {
 		"qop": "auth", "nc": "00000001", "cnonce": "c", "response": resp,
 	})
 	ctx2 := newAuthCtx("GET", "/index.php", hdr)
-	if authenticate(ctx2, cfg) {
+	if authenticate(ctx2, cfg, nil) {
 		t.Fatal("authenticate accepted a request whose uri= does not match the target")
 	}
 }
@@ -418,7 +418,7 @@ func TestAuthenticate_UnknownUserRunsDummyHash(t *testing.T) {
 	// short-circuiting after the map miss.
 	cfg := buildAuth(t, "SHA-256", "r", "alice", "s3cret")
 	ctx1 := newAuthCtx("GET", "/", "")
-	authenticate(ctx1, cfg)
+	authenticate(ctx1, cfg, nil)
 	nonce := extractAuthParam(string(ctx1.Response.Header.Peek("WWW-Authenticate")), "nonce")
 
 	ha1 := computeHA1("SHA-256", "mallory", "r", "whatever")
@@ -428,7 +428,7 @@ func TestAuthenticate_UnknownUserRunsDummyHash(t *testing.T) {
 		"qop": "auth", "nc": "00000001", "cnonce": "c", "response": resp,
 	})
 	ctx2 := newAuthCtx("GET", "/", hdr)
-	if authenticate(ctx2, cfg) {
+	if authenticate(ctx2, cfg, nil) {
 		t.Fatal("authenticate accepted unknown user")
 	}
 	if ctx2.Response.StatusCode() != fasthttp.StatusUnauthorized {

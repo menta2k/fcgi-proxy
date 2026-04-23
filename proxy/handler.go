@@ -115,6 +115,14 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 		locCache = locationcache.New(cfg.Locations, cfg.ReadTimeout)
 	}
 
+	// Build the Basic-auth password cache once per Handler invocation so
+	// repeated requests with the same credentials skip the bcrypt cost.
+	// Nil for disabled or non-basic schemes.
+	var pwCache *passwordCache
+	if cfg.Auth.Enabled && cfg.Auth.Type == config.AuthTypeBasic && cfg.Auth.PasswordCacheEnabled {
+		pwCache = newPasswordCache(cfg.Auth.PasswordCacheTTL, cfg.Auth.PasswordCacheMaxEntries)
+	}
+
 	cleanDocRoot := filepath.Clean(cfg.DocumentRoot)
 
 	return func(ctx *fasthttp.RequestCtx) {
@@ -169,7 +177,7 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 		// information to an anonymous client is safer than leaking validation
 		// details about the request shape.
 		if cfg.Auth.Enabled {
-			if !authenticate(ctx, cfg.Auth) {
+			if !authenticate(ctx, cfg.Auth, pwCache) {
 				applyCORSResponseHeaders(ctx, cfg.CORS, corsResult)
 				return
 			}

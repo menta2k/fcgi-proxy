@@ -16,12 +16,22 @@ import (
 // AuthConfig is the JSON shape for HTTP authentication configuration.
 // Supported schemes: "digest" (RFC 7616) and "basic" (RFC 7617).
 type AuthConfig struct {
-	Enabled       bool       `json:"enabled"`
-	Type          string     `json:"type"`            // "digest" or "basic"
-	Realm         string     `json:"realm"`           // appears in the WWW-Authenticate challenge
-	Algorithm     string     `json:"algorithm"`       // digest only: "SHA-256" (default) or "MD5"
-	NonceLifetime string     `json:"nonce_lifetime"`  // digest only: how long a nonce stays valid
-	Users         []AuthUser `json:"users"`           // inline user database
+	Enabled       bool                 `json:"enabled"`
+	Type          string               `json:"type"`          // "digest" or "basic"
+	Realm         string               `json:"realm"`         // appears in the WWW-Authenticate challenge
+	Algorithm     string               `json:"algorithm"`     // digest only: "SHA-256" (default) or "MD5"
+	NonceLifetime string               `json:"nonce_lifetime"` // digest only: how long a nonce stays valid
+	Users         []AuthUser           `json:"users"`         // inline user database
+	PasswordCache *PasswordCacheConfig `json:"password_cache,omitempty"` // basic auth only
+}
+
+// PasswordCacheConfig controls the Basic-auth password cache. When unset,
+// the cache is enabled with sensible defaults. Set enabled=false to opt out
+// and pay the full bcrypt cost on every request.
+type PasswordCacheConfig struct {
+	Enabled    *bool  `json:"enabled,omitempty"`     // nil or true = enabled; false = disabled
+	TTL        string `json:"ttl,omitempty"`         // default "1m"
+	MaxEntries int    `json:"max_entries,omitempty"` // default 10000
 }
 
 // AuthUser is a single credential entry.
@@ -75,14 +85,26 @@ type ParsedAuth struct {
 	// call on an unknown user takes the same wall-clock time as one on a real
 	// user with a wrong password. Prevents enumeration via timing.
 	DummyBcrypt []byte
+	// PasswordCache, when non-nil, tells the basic-auth middleware to cache
+	// successful authentications. The proxy package owns the cache type;
+	// here we only carry resolved configuration. PasswordCacheEnabled is
+	// false when the operator explicitly opted out.
+	PasswordCacheEnabled    bool
+	PasswordCacheTTL        time.Duration
+	PasswordCacheMaxEntries int
 }
 
 const (
-	minNonceLifetime = 30 * time.Second
-	maxNonceLifetime = 24 * time.Hour
-	defaultNonceLife = 5 * time.Minute
-	maxAuthUsers     = 1000
-	nonceSecretSize  = 32
+	minNonceLifetime         = 30 * time.Second
+	maxNonceLifetime         = 24 * time.Hour
+	defaultNonceLife         = 5 * time.Minute
+	maxAuthUsers             = 1000
+	nonceSecretSize          = 32
+	defaultPasswordCacheTTL  = 1 * time.Minute
+	minPasswordCacheTTL      = 1 * time.Second
+	maxPasswordCacheTTL      = 1 * time.Hour
+	defaultPasswordCacheSize = 10000
+	maxPasswordCacheSize     = 1_000_000
 )
 
 // parseAuth validates AuthConfig and returns a ParsedAuth. When auth is
@@ -124,6 +146,9 @@ func parseAuth(c AuthConfig) (ParsedAuth, error) {
 }
 
 func parseDigestAuth(c AuthConfig, realm string) (ParsedAuth, error) {
+	if c.PasswordCache != nil {
+		return ParsedAuth{}, fmt.Errorf("config: auth.password_cache applies only to basic auth")
+	}
 	algName, hashNew, hashHex, err := parseAuthAlgorithm(c.Algorithm)
 	if err != nil {
 		return ParsedAuth{}, err
@@ -239,14 +264,53 @@ func parseBasicAuth(c AuthConfig, realm string) (ParsedAuth, error) {
 		return ParsedAuth{}, fmt.Errorf("config: generate dummy bcrypt at cost %d: %w", maxCost, err)
 	}
 
+	cacheEnabled, cacheTTL, cacheMaxEntries, err := parsePasswordCacheConfig(c.PasswordCache)
+	if err != nil {
+		return ParsedAuth{}, err
+	}
+
 	return ParsedAuth{
-		Enabled:     true,
-		Type:        AuthTypeBasic,
-		Realm:       realm,
-		RealmBytes:  []byte(realm),
-		Users:       users,
-		DummyBcrypt: dummy,
+		Enabled:                 true,
+		Type:                    AuthTypeBasic,
+		Realm:                   realm,
+		RealmBytes:              []byte(realm),
+		Users:                   users,
+		DummyBcrypt:             dummy,
+		PasswordCacheEnabled:    cacheEnabled,
+		PasswordCacheTTL:        cacheTTL,
+		PasswordCacheMaxEntries: cacheMaxEntries,
 	}, nil
+}
+
+// parsePasswordCacheConfig applies defaults and validation for the optional
+// password_cache block. When c is nil, caching is enabled with defaults.
+func parsePasswordCacheConfig(c *PasswordCacheConfig) (enabled bool, ttl time.Duration, maxEntries int, err error) {
+	enabled = true
+	ttl = defaultPasswordCacheTTL
+	maxEntries = defaultPasswordCacheSize
+	if c == nil {
+		return
+	}
+	if c.Enabled != nil {
+		enabled = *c.Enabled
+	}
+	if c.TTL != "" {
+		d, parseErr := time.ParseDuration(c.TTL)
+		if parseErr != nil {
+			return false, 0, 0, fmt.Errorf("config: invalid auth.password_cache.ttl %q: %w", c.TTL, parseErr)
+		}
+		if d < minPasswordCacheTTL || d > maxPasswordCacheTTL {
+			return false, 0, 0, fmt.Errorf("config: auth.password_cache.ttl must be between %v and %v, got %v", minPasswordCacheTTL, maxPasswordCacheTTL, d)
+		}
+		ttl = d
+	}
+	if c.MaxEntries != 0 {
+		if c.MaxEntries < 1 || c.MaxEntries > maxPasswordCacheSize {
+			return false, 0, 0, fmt.Errorf("config: auth.password_cache.max_entries must be between 1 and %d, got %d", maxPasswordCacheSize, c.MaxEntries)
+		}
+		maxEntries = c.MaxEntries
+	}
+	return
 }
 
 // validateAuthUsername trims, checks for forbidden characters, and returns

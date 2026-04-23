@@ -47,7 +47,12 @@
         "username": "alice",
         "password_hash": "$2b$10$REPLACE_WITH_BCRYPT_HASH_FROM_htpasswd_DASH_B_DASH_n_alice"
       }
-    ]
+    ],
+    "password_cache": {
+      "enabled": true,
+      "ttl": "1m",
+      "max_entries": 10000
+    }
   },
   "locations": [
     {

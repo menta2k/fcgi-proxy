@@ -6,7 +6,18 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
+
+func bcryptHashForTest(password string) (string, error) {
+	h, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		return "", err
+	}
+	return string(h), nil
+}
 
 func sha256HA1(user, realm, password string) string {
 	s := sha256.Sum256([]byte(user + ":" + realm + ":" + password))
@@ -118,6 +129,137 @@ func TestParse_Auth_NonceLifetimeDefault(t *testing.T) {
 	if parsed.Auth.NonceLifetime.Minutes() != 5 {
 		t.Errorf("default nonce lifetime = %v, want 5m", parsed.Auth.NonceLifetime)
 	}
+}
+
+func TestParse_Auth_PasswordCache_DefaultsWhenUnset(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth = AuthConfig{
+		Enabled: true,
+		Type:    "basic",
+		Realm:   "r",
+		Users:   []AuthUser{{Username: "a", PasswordHash: "$2b$04$x"}},
+	}
+	// Replace with a real bcrypt hash to pass validation.
+	cfg.Auth.Users[0].PasswordHash = validBcryptHash(t)
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !parsed.Auth.PasswordCacheEnabled {
+		t.Error("password cache should be enabled by default for basic auth")
+	}
+	if parsed.Auth.PasswordCacheTTL != 1*time.Minute {
+		t.Errorf("default TTL = %v, want 1m", parsed.Auth.PasswordCacheTTL)
+	}
+	if parsed.Auth.PasswordCacheMaxEntries != 10000 {
+		t.Errorf("default MaxEntries = %d, want 10000", parsed.Auth.PasswordCacheMaxEntries)
+	}
+}
+
+func TestParse_Auth_PasswordCache_ExplicitDisable(t *testing.T) {
+	disabled := false
+	cfg := DefaultConfig()
+	cfg.Auth = AuthConfig{
+		Enabled: true,
+		Type:    "basic",
+		Realm:   "r",
+		Users:   []AuthUser{{Username: "a", PasswordHash: validBcryptHash(t)}},
+		PasswordCache: &PasswordCacheConfig{
+			Enabled: &disabled,
+		},
+	}
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.Auth.PasswordCacheEnabled {
+		t.Error("expected cache disabled when enabled=false")
+	}
+}
+
+func TestParse_Auth_PasswordCache_CustomValues(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth = AuthConfig{
+		Enabled: true,
+		Type:    "basic",
+		Realm:   "r",
+		Users:   []AuthUser{{Username: "a", PasswordHash: validBcryptHash(t)}},
+		PasswordCache: &PasswordCacheConfig{
+			TTL:        "30s",
+			MaxEntries: 500,
+		},
+	}
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.Auth.PasswordCacheTTL != 30*time.Second {
+		t.Errorf("TTL = %v, want 30s", parsed.Auth.PasswordCacheTTL)
+	}
+	if parsed.Auth.PasswordCacheMaxEntries != 500 {
+		t.Errorf("MaxEntries = %d, want 500", parsed.Auth.PasswordCacheMaxEntries)
+	}
+}
+
+func TestParse_Auth_PasswordCache_InvalidTTL(t *testing.T) {
+	tests := []string{"garbage", "0ms", "10h"}
+	for _, ttl := range tests {
+		t.Run(ttl, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Auth = AuthConfig{
+				Enabled: true,
+				Type:    "basic",
+				Realm:   "r",
+				Users:   []AuthUser{{Username: "a", PasswordHash: validBcryptHash(t)}},
+				PasswordCache: &PasswordCacheConfig{TTL: ttl},
+			}
+			if _, err := Parse(cfg); err == nil {
+				t.Fatalf("expected error for TTL %q", ttl)
+			}
+		})
+	}
+}
+
+func TestParse_Auth_PasswordCache_InvalidMaxEntries(t *testing.T) {
+	tests := []int{-1, 2_000_000}
+	for _, n := range tests {
+		cfg := DefaultConfig()
+		cfg.Auth = AuthConfig{
+			Enabled: true,
+			Type:    "basic",
+			Realm:   "r",
+			Users:   []AuthUser{{Username: "a", PasswordHash: validBcryptHash(t)}},
+			PasswordCache: &PasswordCacheConfig{MaxEntries: n},
+		}
+		if _, err := Parse(cfg); err == nil {
+			t.Errorf("expected error for MaxEntries=%d", n)
+		}
+	}
+}
+
+func TestParse_Auth_PasswordCache_RejectedForDigest(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth = AuthConfig{
+		Enabled: true,
+		Type:    "digest",
+		Realm:   "r",
+		Users:   []AuthUser{{Username: "a", HA1: sha256HA1("a", "r", "p")}},
+		PasswordCache: &PasswordCacheConfig{},
+	}
+	if _, err := Parse(cfg); err == nil {
+		t.Fatal("password_cache must be rejected on digest auth")
+	}
+}
+
+// validBcryptHash generates a real bcrypt hash at the minimum cost for use
+// in config-validation tests (keeps tests fast; cache behavior is orthogonal).
+func validBcryptHash(t *testing.T) string {
+	t.Helper()
+	h, err := bcryptHashForTest("x")
+	if err != nil {
+		t.Fatalf("bcrypt: %v", err)
+	}
+	return h
 }
 
 func TestParse_Auth_Invalid(t *testing.T) {

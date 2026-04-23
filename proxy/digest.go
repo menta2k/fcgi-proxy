@@ -222,10 +222,11 @@ func validateNonce(cfg config.ParsedAuth, nonce []byte) (valid, stale bool) {
 // authenticate dispatches the incoming request to the configured auth
 // scheme. On failure it writes a 401 challenge and returns false; the caller
 // should stop processing but may still apply trailing response headers
-// (CORS, response_headers) before returning.
-func authenticate(ctx *fasthttp.RequestCtx, cfg config.ParsedAuth) bool {
+// (CORS, response_headers) before returning. The cache argument is only
+// consulted by basic auth; digest ignores it.
+func authenticate(ctx *fasthttp.RequestCtx, cfg config.ParsedAuth, cache *passwordCache) bool {
 	if cfg.Type == config.AuthTypeBasic {
-		return authenticateBasic(ctx, cfg)
+		return authenticateBasic(ctx, cfg, cache)
 	}
 	return authenticateDigest(ctx, cfg)
 }
