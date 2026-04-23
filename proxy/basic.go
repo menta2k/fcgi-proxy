@@ -65,11 +65,16 @@ func authenticateBasic(ctx *fasthttp.RequestCtx, cfg config.ParsedAuth, cache *p
 
 	// Fast path: recently-verified credentials skip the bcrypt compare.
 	// Only successful outcomes are cached, so a cache hit is proof of a
-	// prior full verification against this exact stored hash.
-	var key [32]byte
+	// prior full verification against this exact stored hash. A single
+	// time.Now() reading is reused for both the check and the set to keep
+	// the TTL measurement consistent within a single request.
+	var (
+		key [32]byte
+		now = time.Now()
+	)
 	if cache != nil {
-		key = cacheKey(hash, password)
-		if cache.check(key, time.Now()) {
+		key = cache.key(hash, password)
+		if cache.check(key, now) {
 			return true
 		}
 	}
@@ -80,7 +85,7 @@ func authenticateBasic(ctx *fasthttp.RequestCtx, cfg config.ParsedAuth, cache *p
 	}
 
 	if cache != nil {
-		cache.set(key, time.Now())
+		cache.set(key, now)
 	}
 	return true
 }

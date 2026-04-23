@@ -229,12 +229,12 @@ func TestBasicAuth_CacheHitSkipsBcrypt(t *testing.T) {
 	if !authenticate(ctx, cfg, cache) {
 		t.Fatal("first auth should succeed")
 	}
-	h, m := cache.Stats()
+	h, m := cache.stats()
 	if h != 0 || m != 1 {
 		t.Errorf("after 1st: hits=%d misses=%d, want 0/1", h, m)
 	}
-	if cache.Len() != 1 {
-		t.Errorf("cache Len = %d, want 1", cache.Len())
+	if cache.length() != 1 {
+		t.Errorf("cache Len = %d, want 1", cache.length())
 	}
 
 	// Hit → no bcrypt work.
@@ -242,7 +242,7 @@ func TestBasicAuth_CacheHitSkipsBcrypt(t *testing.T) {
 	if !authenticate(ctx, cfg, cache) {
 		t.Fatal("second auth should succeed via cache")
 	}
-	h, m = cache.Stats()
+	h, m = cache.stats()
 	if h != 1 || m != 1 {
 		t.Errorf("after 2nd: hits=%d misses=%d, want 1/1", h, m)
 	}
@@ -256,8 +256,8 @@ func TestBasicAuth_WrongPasswordDoesNotCache(t *testing.T) {
 	if authenticate(ctx, cfg, cache) {
 		t.Fatal("wrong password should not authenticate")
 	}
-	if cache.Len() != 0 {
-		t.Errorf("failures must not populate the cache; Len = %d", cache.Len())
+	if cache.length() != 0 {
+		t.Errorf("failures must not populate the cache; Len = %d", cache.length())
 	}
 }
 
@@ -269,12 +269,12 @@ func TestBasicAuth_UnknownUserDoesNotCache(t *testing.T) {
 	if authenticate(ctx, cfg, cache) {
 		t.Fatal("unknown user should not authenticate")
 	}
-	if cache.Len() != 0 {
-		t.Errorf("unknown users must not populate the cache; Len = %d", cache.Len())
+	if cache.length() != 0 {
+		t.Errorf("unknown users must not populate the cache; Len = %d", cache.length())
 	}
 	// Also: the cache check must not have been reached on the unknown-user
 	// short-circuit, so hits and misses both remain zero.
-	h, m := cache.Stats()
+	h, m := cache.stats()
 	if h != 0 || m != 0 {
 		t.Errorf("cache touched on unknown user: hits=%d misses=%d", h, m)
 	}
@@ -290,7 +290,7 @@ func TestBasicAuth_CacheHitSurvivesDistinctContexts(t *testing.T) {
 			t.Fatalf("iter %d: auth should succeed", i)
 		}
 	}
-	h, m := cache.Stats()
+	h, m := cache.stats()
 	if m != 1 {
 		t.Errorf("expected exactly 1 bcrypt miss across 5 requests, got %d", m)
 	}
