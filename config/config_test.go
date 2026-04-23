@@ -415,8 +415,8 @@ func TestParse_CORS_Valid(t *testing.T) {
 	if parsed.CORS.AllowedMethods != "GET, POST, OPTIONS" {
 		t.Errorf("AllowedMethods = %q, want normalized upper-case join", parsed.CORS.AllowedMethods)
 	}
-	if parsed.CORS.MaxAgeSeconds != 300 {
-		t.Errorf("MaxAgeSeconds = %d, want 300", parsed.CORS.MaxAgeSeconds)
+	if parsed.CORS.MaxAge != "300" {
+		t.Errorf("MaxAge = %q, want %q", parsed.CORS.MaxAge, "300")
 	}
 	if !parsed.CORS.AllowCredentials {
 		t.Error("expected AllowCredentials true")
@@ -583,8 +583,8 @@ func TestParse_CORS_ZeroMaxAgeOmitted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if parsed.CORS.MaxAgeSeconds != 0 {
-		t.Errorf("MaxAgeSeconds = %d, want 0 when unset", parsed.CORS.MaxAgeSeconds)
+	if parsed.CORS.MaxAge != "" {
+		t.Errorf("MaxAge = %q, want empty when unset", parsed.CORS.MaxAge)
 	}
 }
 
@@ -676,11 +676,11 @@ func TestParse_CORS_ResponseHeadersOKWhenCORSDisabled(t *testing.T) {
 func TestParse_CORS_MaxAgeDurationConversion(t *testing.T) {
 	cases := []struct {
 		input string
-		want  int
+		want  string
 	}{
-		{"30s", 30},
-		{"10m", 600},
-		{"1h", 3600},
+		{"30s", "30"},
+		{"10m", "600"},
+		{"1h", "3600"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.input, func(t *testing.T) {
@@ -694,8 +694,8 @@ func TestParse_CORS_MaxAgeDurationConversion(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if parsed.CORS.MaxAgeSeconds != tc.want {
-				t.Errorf("MaxAgeSeconds = %d, want %d", parsed.CORS.MaxAgeSeconds, tc.want)
+			if parsed.CORS.MaxAge != tc.want {
+				t.Errorf("MaxAge = %q, want %q", parsed.CORS.MaxAge, tc.want)
 			}
 		})
 	}

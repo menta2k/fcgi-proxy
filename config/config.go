@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -75,15 +76,19 @@ type Parsed struct {
 }
 
 // ParsedCORS holds validated CORS settings with pre-built header values.
+// All header values are pre-formatted at parse time so the request hot path
+// allocates nothing.
 type ParsedCORS struct {
 	Enabled          bool
 	AllowAllOrigins  bool                // true if "*" is configured (implies !AllowCredentials)
-	AllowedOrigins   map[string]struct{} // exact-match allowlist (empty when AllowAllOrigins)
+	AllowedOrigins   map[string]struct{} // lowercase allowlist (empty when AllowAllOrigins)
 	AllowedMethods   string              // comma-joined, ready for Access-Control-Allow-Methods
 	AllowedHeaders   string              // comma-joined, ready for Access-Control-Allow-Headers
 	ExposedHeaders   string              // comma-joined, ready for Access-Control-Expose-Headers
 	AllowCredentials bool
-	MaxAgeSeconds    int // 0 means omit the header
+	// MaxAge is the pre-formatted Access-Control-Max-Age value (seconds as a
+	// decimal string). Empty means omit the header.
+	MaxAge string
 }
 
 const (
@@ -353,7 +358,7 @@ func parseCORS(c CORSConfig) (ParsedCORS, error) {
 		return ParsedCORS{}, err
 	}
 
-	maxAgeSec := 0
+	maxAge := ""
 	if c.MaxAge != "" {
 		d, parseErr := time.ParseDuration(c.MaxAge)
 		if parseErr != nil {
@@ -365,7 +370,9 @@ func parseCORS(c CORSConfig) (ParsedCORS, error) {
 		if d > maxCORSMaxAge {
 			return ParsedCORS{}, fmt.Errorf("config: cors.max_age must not exceed %v, got %v", maxCORSMaxAge, d)
 		}
-		maxAgeSec = int(d.Seconds())
+		if secs := int(d.Seconds()); secs > 0 {
+			maxAge = strconv.Itoa(secs)
+		}
 	}
 
 	return ParsedCORS{
@@ -376,7 +383,7 @@ func parseCORS(c CORSConfig) (ParsedCORS, error) {
 		AllowedHeaders:   headers,
 		ExposedHeaders:   exposed,
 		AllowCredentials: c.AllowCredentials,
-		MaxAgeSeconds:    maxAgeSec,
+		MaxAge:           maxAge,
 	}, nil
 }
 

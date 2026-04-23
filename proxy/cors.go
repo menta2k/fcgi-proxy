@@ -1,9 +1,6 @@
 package proxy
 
 import (
-	"bytes"
-	"strconv"
-
 	"github.com/menta2k/fcgi-proxy/config"
 	"github.com/valyala/fasthttp"
 )
@@ -54,7 +51,7 @@ func handleCORS(ctx *fasthttp.RequestCtx, cfg config.ParsedCORS) corsDecision {
 		// Reject control characters in the echoed request-headers list before
 		// it reaches the response writer. Prevents CRLF injection via a
 		// malicious Access-Control-Request-Headers value.
-		if reqHeaders := ctx.Request.Header.Peek("Access-Control-Request-Headers"); bytes.ContainsAny(reqHeaders, "\r\n\x00") {
+		if reqHeaders := ctx.Request.Header.Peek("Access-Control-Request-Headers"); hasHeaderInjectionBytes(reqHeaders) {
 			ctx.Response.Header.Set("Vary", "Origin")
 			ctx.SetStatusCode(fasthttp.StatusBadRequest)
 			ctx.SetContentType("text/plain")
@@ -119,8 +116,8 @@ func writeCORSHeaders(ctx *fasthttp.RequestCtx, cfg config.ParsedCORS, origin []
 			ctx.Response.Header.SetBytesV("Access-Control-Allow-Headers", reqHeaders)
 			ctx.Response.Header.Add("Vary", "Access-Control-Request-Headers")
 		}
-		if cfg.MaxAgeSeconds > 0 {
-			ctx.Response.Header.Set("Access-Control-Max-Age", strconv.Itoa(cfg.MaxAgeSeconds))
+		if cfg.MaxAge != "" {
+			ctx.Response.Header.Set("Access-Control-Max-Age", cfg.MaxAge)
 		}
 		return
 	}
@@ -175,6 +172,20 @@ func originAllowed(cfg config.ParsedCORS, origin []byte) bool {
 func containsUpperASCII(b []byte) bool {
 	for _, c := range b {
 		if c >= 'A' && c <= 'Z' {
+			return true
+		}
+	}
+	return false
+}
+
+// hasHeaderInjectionBytes reports whether b contains bytes that could split or
+// terminate an HTTP header field (CR, LF, or NUL). fasthttp's request parser
+// already normalizes CR/LF on parse, so this is defense-in-depth — the NUL
+// branch also covers cases where a future fasthttp change admits raw bytes.
+// Single-pass byte scan, zero allocations.
+func hasHeaderInjectionBytes(b []byte) bool {
+	for _, c := range b {
+		if c == '\r' || c == '\n' || c == 0 {
 			return true
 		}
 	}
