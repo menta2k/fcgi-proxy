@@ -326,6 +326,22 @@ func TestHandleCORS_AppSchemeOriginMatches(t *testing.T) {
 	}
 }
 
+func TestHandleCORS_AppSchemeOriginWithPort(t *testing.T) {
+	cors := enabledCORS(t, config.CORSConfig{
+		Enabled:        true,
+		AllowedOrigins: []string{"app://localhost:8080"},
+	})
+	ctx := newCtx("GET", "app://localhost:8080", "", "")
+	decision := handleCORS(ctx, cors)
+	if !decision.originAllowed {
+		t.Fatal("app://localhost:8080 should match allowlist entry with matching port")
+	}
+	applyCORSResponseHeaders(ctx, cors, decision)
+	if got := string(ctx.Response.Header.Peek("Access-Control-Allow-Origin")); got != "app://localhost:8080" {
+		t.Errorf("Allow-Origin = %q", got)
+	}
+}
+
 func TestHandleCORS_AppSchemePreflight(t *testing.T) {
 	cors := enabledCORS(t, config.CORSConfig{
 		Enabled:          true,

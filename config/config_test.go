@@ -558,6 +558,70 @@ func TestParse_CORS_AppSchemeEmptyHostRejected(t *testing.T) {
 	}
 }
 
+func TestParse_CORS_ValidHostPorts(t *testing.T) {
+	valid := []string{
+		"http://example.com",
+		"https://example.com:443",
+		"app://localhost:8080",
+		"app://localhost:1",
+		"app://localhost:65535",
+		"http://[::1]",
+		"http://[::1]:80",
+		"https://[2001:db8::1]:8443",
+	}
+	for _, o := range valid {
+		t.Run(o, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.CORS = CORSConfig{Enabled: true, AllowedOrigins: []string{o}}
+			if _, err := Parse(cfg); err != nil {
+				t.Fatalf("expected %q to validate, got: %v", o, err)
+			}
+		})
+	}
+}
+
+func TestParse_CORS_InvalidHostPorts(t *testing.T) {
+	tests := []struct {
+		name   string
+		origin string
+	}{
+		{"colon-not-port", "app://loc:alhost"},
+		{"trailing colon", "app://localhost:"},
+		{"leading colon", "app://:8080"},
+		{"port alpha", "https://example.com:abc"},
+		{"port zero", "https://example.com:0"},
+		{"port too large", "https://example.com:65536"},
+		{"port way too large", "https://example.com:999999"},
+		{"port negative sign", "https://example.com:-1"},
+		{"multiple colons unbracketed", "http://::1"},
+		{"userinfo", "https://user:pass@example.com"},
+		{"userinfo no pass", "https://user@example.com"},
+		{"ipv6 unclosed", "http://[::1"},
+		{"ipv6 empty", "http://[]"},
+		{"junk after ipv6", "http://[::1]junk"},
+		{"ipv6 empty port", "http://[::1]:"},
+		{"ipv6 bad port", "http://[::1]:abc"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.CORS = CORSConfig{Enabled: true, AllowedOrigins: []string{tt.origin}}
+			if _, err := Parse(cfg); err == nil {
+				t.Fatalf("expected %q to be rejected", tt.origin)
+			}
+		})
+	}
+}
+
+func TestValidateOriginPort_ZeroAlloc(t *testing.T) {
+	allocs := testing.AllocsPerRun(100, func() {
+		_ = validateOriginPort("8080")
+	})
+	if allocs != 0 {
+		t.Errorf("validateOriginPort allocated %.1f times per run, want 0", allocs)
+	}
+}
+
 func TestParse_CORS_InvalidMethod(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.CORS = CORSConfig{

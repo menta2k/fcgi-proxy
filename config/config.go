@@ -406,10 +406,13 @@ func hasCORSHeaderPrefix(name string) bool {
 	return true
 }
 
-// validateOrigin checks that an origin has the form scheme://host[:port] with no path.
-// Scheme is compared case-insensitively per RFC 6454 §6.2. In addition to http
-// and https, "app" is accepted so Cordova/hybrid mobile apps that send
-// Origin: app://localhost (or similar) can be allowlisted explicitly.
+// validateOrigin checks that an origin has the form scheme://host[:port] with
+// no path, query, or fragment. Scheme is compared case-insensitively per
+// RFC 6454 §6.2. In addition to http and https, "app" is accepted so Cordova
+// and hybrid mobile apps that send Origin: app://localhost can be allowlisted.
+// The host is validated structurally: bare hostname, hostname:port, or
+// bracketed IPv6 [addr][:port]. If a port is present it must be decimal and
+// in the range 1-65535. Zero allocations in the validation path.
 func validateOrigin(origin string) error {
 	if origin == "null" {
 		// "null" is a valid Origin for sandboxed iframes/file://; allow it.
@@ -432,6 +435,71 @@ func validateOrigin(origin string) error {
 	}
 	if strings.ContainsAny(rest, "/?#") {
 		return fmt.Errorf("must not contain a path, query, or fragment")
+	}
+	return validateOriginHostPort(rest)
+}
+
+// validateOriginHostPort validates the host[:port] portion of an origin.
+// Accepts: "example.com", "example.com:443", "[::1]", "[::1]:443".
+// Rejects: userinfo (@), empty host, multiple unbracketed colons, empty or
+// non-numeric port, port out of 1-65535 range.
+func validateOriginHostPort(hp string) error {
+	if strings.IndexByte(hp, '@') >= 0 {
+		return fmt.Errorf("must not contain userinfo (@)")
+	}
+
+	// Bracketed IPv6 literal: "[...]", optionally followed by ":port".
+	if hp[0] == '[' {
+		rbracket := strings.IndexByte(hp, ']')
+		if rbracket < 0 {
+			return fmt.Errorf("IPv6 literal missing closing ']'")
+		}
+		if rbracket == 1 {
+			return fmt.Errorf("IPv6 literal is empty")
+		}
+		tail := hp[rbracket+1:]
+		if tail == "" {
+			return nil
+		}
+		if tail[0] != ':' {
+			return fmt.Errorf("unexpected character after IPv6 literal")
+		}
+		return validateOriginPort(tail[1:])
+	}
+
+	idx := strings.IndexByte(hp, ':')
+	if idx < 0 {
+		return nil
+	}
+	// Unbracketed form: exactly one colon, separating host from port.
+	if strings.IndexByte(hp[idx+1:], ':') >= 0 {
+		return fmt.Errorf("host contains multiple colons (IPv6 literals must use [brackets])")
+	}
+	if idx == 0 {
+		return fmt.Errorf("host is empty before port")
+	}
+	return validateOriginPort(hp[idx+1:])
+}
+
+// validateOriginPort checks that p is a decimal port in 1..65535. Zero
+// allocations — byte-level arithmetic, no strconv.
+func validateOriginPort(p string) error {
+	if p == "" {
+		return fmt.Errorf("port is empty")
+	}
+	if len(p) > 5 {
+		return fmt.Errorf("port %q is too long", p)
+	}
+	n := 0
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		if c < '0' || c > '9' {
+			return fmt.Errorf("port %q must be numeric", p)
+		}
+		n = n*10 + int(c-'0')
+	}
+	if n < 1 || n > 65535 {
+		return fmt.Errorf("port %d out of range 1-65535", n)
 	}
 	return nil
 }
