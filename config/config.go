@@ -407,7 +407,9 @@ func hasCORSHeaderPrefix(name string) bool {
 }
 
 // validateOrigin checks that an origin has the form scheme://host[:port] with no path.
-// Scheme is compared case-insensitively per RFC 6454 §6.2.
+// Scheme is compared case-insensitively per RFC 6454 §6.2. In addition to http
+// and https, "app" is accepted so Cordova/hybrid mobile apps that send
+// Origin: app://localhost (or similar) can be allowlisted explicitly.
 func validateOrigin(origin string) error {
 	if origin == "null" {
 		// "null" is a valid Origin for sandboxed iframes/file://; allow it.
@@ -421,9 +423,9 @@ func validateOrigin(origin string) error {
 		return fmt.Errorf("missing scheme (expected scheme://host)")
 	}
 	switch strings.ToLower(scheme) {
-	case "http", "https":
+	case "http", "https", "app":
 	default:
-		return fmt.Errorf("scheme must be http or https, got %q", scheme)
+		return fmt.Errorf("scheme must be http, https, or app, got %q", scheme)
 	}
 	if rest == "" {
 		return fmt.Errorf("missing host")

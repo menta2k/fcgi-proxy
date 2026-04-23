@@ -308,6 +308,47 @@ func TestHandleCORS_SimpleRequest_DisallowedOriginStillEmitsVary(t *testing.T) {
 	}
 }
 
+// A Cordova-style request carrying Origin: app://localhost must match an
+// app://localhost allowlist entry and receive the echoed Allow-Origin header.
+func TestHandleCORS_AppSchemeOriginMatches(t *testing.T) {
+	cors := enabledCORS(t, config.CORSConfig{
+		Enabled:        true,
+		AllowedOrigins: []string{"app://localhost"},
+	})
+	ctx := newCtx("GET", "app://localhost", "", "")
+	decision := handleCORS(ctx, cors)
+	if !decision.originAllowed {
+		t.Fatal("app://localhost should match app://localhost allowlist entry")
+	}
+	applyCORSResponseHeaders(ctx, cors, decision)
+	if got := string(ctx.Response.Header.Peek("Access-Control-Allow-Origin")); got != "app://localhost" {
+		t.Errorf("Allow-Origin = %q, want \"app://localhost\"", got)
+	}
+}
+
+func TestHandleCORS_AppSchemePreflight(t *testing.T) {
+	cors := enabledCORS(t, config.CORSConfig{
+		Enabled:          true,
+		AllowedOrigins:   []string{"app://localhost"},
+		AllowedMethods:   []string{"GET", "POST"},
+		AllowCredentials: true,
+	})
+	ctx := newCtx("OPTIONS", "app://localhost", "POST", "")
+	decision := handleCORS(ctx, cors)
+	if !decision.handled {
+		t.Fatal("expected preflight to be handled")
+	}
+	if ctx.Response.StatusCode() != fasthttp.StatusNoContent {
+		t.Errorf("status = %d, want 204", ctx.Response.StatusCode())
+	}
+	if got := string(ctx.Response.Header.Peek("Access-Control-Allow-Origin")); got != "app://localhost" {
+		t.Errorf("Allow-Origin = %q", got)
+	}
+	if got := string(ctx.Response.Header.Peek("Access-Control-Allow-Credentials")); got != "true" {
+		t.Errorf("Allow-Credentials = %q, want true", got)
+	}
+}
+
 func TestHandleCORS_OriginCaseInsensitive(t *testing.T) {
 	cors := enabledCORS(t, config.CORSConfig{
 		Enabled:        true,

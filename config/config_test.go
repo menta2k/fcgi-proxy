@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -506,6 +507,54 @@ func TestParse_CORS_NullOrigin(t *testing.T) {
 	}
 	if _, err := Parse(cfg); err != nil {
 		t.Fatalf("expected \"null\" origin to be accepted, got %v", err)
+	}
+}
+
+// Cordova / hybrid-mobile apps can send Origin: app://... — the scheme must be
+// accepted by the validator (exact-match allowlisting still applies).
+func TestParse_CORS_AppSchemeOrigin(t *testing.T) {
+	tests := []string{
+		"app://localhost",
+		"app://app.example.com",
+		"APP://Localhost", // case-insensitive scheme
+	}
+	for _, origin := range tests {
+		t.Run(origin, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.CORS = CORSConfig{
+				Enabled:        true,
+				AllowedOrigins: []string{origin},
+			}
+			parsed, err := Parse(cfg)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if _, ok := parsed.CORS.AllowedOrigins[strings.ToLower(origin)]; !ok {
+				t.Errorf("origin %q missing from allowlist: %v", origin, parsed.CORS.AllowedOrigins)
+			}
+		})
+	}
+}
+
+func TestParse_CORS_AppSchemeWithPathRejected(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CORS = CORSConfig{
+		Enabled:        true,
+		AllowedOrigins: []string{"app://localhost/foo"},
+	}
+	if _, err := Parse(cfg); err == nil {
+		t.Fatal("expected error for app-scheme origin with path component")
+	}
+}
+
+func TestParse_CORS_AppSchemeEmptyHostRejected(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CORS = CORSConfig{
+		Enabled:        true,
+		AllowedOrigins: []string{"app://"},
+	}
+	if _, err := Parse(cfg); err == nil {
+		t.Fatal("expected error for app-scheme origin with empty host")
 	}
 }
 
