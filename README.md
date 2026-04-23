@@ -19,6 +19,7 @@ A high-performance reverse proxy that sits in front of FastCGI servers like PHP-
 - Robust CGI parameter construction (SERVER_NAME, REMOTE_ADDR, PATH_INFO, etc.)
 - **Location cache** — proxy specific paths to external HTTP servers with in-memory caching
 - **Configurable response headers** — inject security headers (HSTS, X-Frame-Options, etc.) into every response
+- **Configurable CORS** — preflight handling, origin allowlist, credentials, exposed headers, and max-age driven entirely from `config.json`
 - **Memory-optimized** — `sync.Pool` for hot-path buffers, zero-allocation header processing, pre-sized maps
 - Path traversal prevention with `filepath.Rel` boundary checks
 - httpoxy (CVE-2016-5385) protection

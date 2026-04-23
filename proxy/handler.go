@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/menta2k/fcgi-proxy/config"
 	"github.com/menta2k/fcgi-proxy/fcgi"
 	"github.com/menta2k/fcgi-proxy/proxy/locationcache"
 	"github.com/valyala/fasthttp"
@@ -42,6 +43,9 @@ type Config struct {
 	LocationCache *locationcache.Cache
 	// Pool configures the FastCGI connection pool.
 	Pool fcgi.PoolConfig
+	// CORS configures Cross-Origin Resource Sharing. When Enabled is false,
+	// CORS handling is a no-op.
+	CORS config.ParsedCORS
 }
 
 // Headers that must not be forwarded from the upstream response (lowercase for case-insensitive lookup).
@@ -99,6 +103,13 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 	cleanDocRoot := filepath.Clean(cfg.DocumentRoot)
 
 	return func(ctx *fasthttp.RequestCtx) {
+		// CORS runs first so preflights are answered without touching the
+		// upstream and so every response path can receive CORS headers.
+		corsResult := handleCORS(ctx, cfg.CORS)
+		if corsResult.handled {
+			return
+		}
+
 		uriPath := string(ctx.URI().Path())
 
 		// Health check endpoint — responds without touching the upstream.
@@ -108,6 +119,7 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 			ctx.SetStatusCode(fasthttp.StatusOK)
 			ctx.SetContentType("text/plain")
 			ctx.SetBodyString("ok")
+			applyCORSResponseHeaders(ctx, cfg.CORS, corsResult)
 			return
 		}
 
@@ -115,6 +127,7 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 		if locCache != nil {
 			if loc, ok := locCache.Match(uriPath); ok {
 				serveLocationCache(ctx, locCache, loc, cfg.ResponseHeaders)
+				applyCORSResponseHeaders(ctx, cfg.CORS, corsResult)
 				return
 			}
 		}
@@ -175,6 +188,10 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 		}
 
 		ctx.SetBody(resp.Body)
+
+		// Apply CORS headers last so they take precedence over any upstream or
+		// response_headers-provided Access-Control-* values.
+		applyCORSResponseHeaders(ctx, cfg.CORS, corsResult)
 	}
 }
 
@@ -231,9 +248,17 @@ func buildParams(ctx *fasthttp.RequestCtx, cfg Config, docRoot, scriptFilename, 
 	// Reusable buffer for building HTTP_* env key names to avoid
 	// per-header string(key) + ToUpper + ReplaceAll allocations.
 	var envKeyBuf [256]byte
+	corsEnabled := cfg.CORS.Enabled
 	for key, val := range ctx.Request.Header.All() {
 		// Check blocklist using byte comparison to avoid string(key) allocation.
 		if isBlockedHeader(key) {
+			continue
+		}
+		// When the proxy is the CORS authority, do not forward Origin or the
+		// Access-Control-Request-* preflight negotiation headers to the
+		// backend — prevents dual-CORS authority and duplicate response
+		// headers from backend-emitted CORS logic.
+		if corsEnabled && isCORSRequestHeader(key) {
 			continue
 		}
 
@@ -367,6 +392,39 @@ func isBlockedHeader(key []byte) bool {
 		lower[i] = b
 	}
 	return blockedRequestHeaders[string(lower)]
+}
+
+// isCORSRequestHeader reports whether a header name (as bytes) identifies a
+// CORS negotiation header that must not reach the FCGI backend when the proxy
+// is the CORS authority. Zero-allocation byte-level match.
+func isCORSRequestHeader(key []byte) bool {
+	switch len(key) {
+	case 6: // Origin
+		return asciiEqualFold(key, "origin")
+	case 29: // Access-Control-Request-Method
+		return asciiEqualFold(key, "access-control-request-method")
+	case 30: // Access-Control-Request-Headers
+		return asciiEqualFold(key, "access-control-request-headers")
+	}
+	return false
+}
+
+// asciiEqualFold compares a byte slice to a lowercase ASCII string of the same
+// length, case-insensitively. Zero allocations.
+func asciiEqualFold(a []byte, lower string) bool {
+	if len(a) != len(lower) {
+		return false
+	}
+	for i := range len(lower) {
+		c := a[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != lower[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // buildEnvKey builds "HTTP_" + UPPER(key with - replaced by _) in a single pass.

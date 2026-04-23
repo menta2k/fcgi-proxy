@@ -16,6 +16,15 @@
     "X-Frame-Options": "DENY",
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains"
   },
+  "cors": {
+    "enabled": false,
+    "allowed_origins": ["https://app.example.com"],
+    "allowed_methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    "allowed_headers": ["Content-Type", "Authorization"],
+    "exposed_headers": ["X-Request-Id"],
+    "allow_credentials": false,
+    "max_age": "10m"
+  },
   "locations": [
     {
       "path": "/apple-app-site-association",

@@ -376,3 +376,328 @@ func TestParse_Locations_TooMany(t *testing.T) {
 		t.Fatal("expected error for too many locations")
 	}
 }
+
+func TestParse_CORS_Disabled(t *testing.T) {
+	cfg := DefaultConfig()
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.CORS.Enabled {
+		t.Error("expected CORS disabled by default")
+	}
+}
+
+func TestParse_CORS_Valid(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CORS = CORSConfig{
+		Enabled:          true,
+		AllowedOrigins:   []string{"https://app.example.com", "https://admin.example.com"},
+		AllowedMethods:   []string{"get", "POST", "options"},
+		AllowedHeaders:   []string{"Content-Type", "Authorization"},
+		ExposedHeaders:   []string{"X-Request-Id"},
+		AllowCredentials: true,
+		MaxAge:           "5m",
+	}
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !parsed.CORS.Enabled {
+		t.Fatal("expected CORS enabled")
+	}
+	if parsed.CORS.AllowAllOrigins {
+		t.Error("AllowAllOrigins should be false for explicit origins")
+	}
+	if _, ok := parsed.CORS.AllowedOrigins["https://app.example.com"]; !ok {
+		t.Error("expected app.example.com in allowlist")
+	}
+	if parsed.CORS.AllowedMethods != "GET, POST, OPTIONS" {
+		t.Errorf("AllowedMethods = %q, want normalized upper-case join", parsed.CORS.AllowedMethods)
+	}
+	if parsed.CORS.MaxAgeSeconds != 300 {
+		t.Errorf("MaxAgeSeconds = %d, want 300", parsed.CORS.MaxAgeSeconds)
+	}
+	if !parsed.CORS.AllowCredentials {
+		t.Error("expected AllowCredentials true")
+	}
+}
+
+func TestParse_CORS_Wildcard(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CORS = CORSConfig{
+		Enabled:        true,
+		AllowedOrigins: []string{"*"},
+	}
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !parsed.CORS.AllowAllOrigins {
+		t.Error("expected AllowAllOrigins true")
+	}
+}
+
+func TestParse_CORS_WildcardWithCredentials(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CORS = CORSConfig{
+		Enabled:          true,
+		AllowedOrigins:   []string{"*"},
+		AllowCredentials: true,
+	}
+	_, err := Parse(cfg)
+	if err == nil {
+		t.Fatal("expected error mixing wildcard with credentials")
+	}
+}
+
+func TestParse_CORS_WildcardMixedWithOrigin(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CORS = CORSConfig{
+		Enabled:        true,
+		AllowedOrigins: []string{"*", "https://app.example.com"},
+	}
+	_, err := Parse(cfg)
+	if err == nil {
+		t.Fatal("expected error mixing wildcard with explicit origin")
+	}
+}
+
+func TestParse_CORS_EmptyOrigins(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CORS = CORSConfig{Enabled: true}
+	_, err := Parse(cfg)
+	if err == nil {
+		t.Fatal("expected error when allowed_origins is empty")
+	}
+}
+
+func TestParse_CORS_InvalidOrigins(t *testing.T) {
+	tests := []struct {
+		name   string
+		origin string
+	}{
+		{"missing scheme", "example.com"},
+		{"bad scheme", "ftp://example.com"},
+		{"with path", "https://example.com/foo"},
+		{"with query", "https://example.com?x=1"},
+		{"whitespace", "https://exa mple.com"},
+		{"empty", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.CORS = CORSConfig{
+				Enabled:        true,
+				AllowedOrigins: []string{tt.origin},
+			}
+			if _, err := Parse(cfg); err == nil {
+				t.Fatalf("expected error for origin %q", tt.origin)
+			}
+		})
+	}
+}
+
+func TestParse_CORS_NullOrigin(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CORS = CORSConfig{
+		Enabled:        true,
+		AllowedOrigins: []string{"null"},
+	}
+	if _, err := Parse(cfg); err != nil {
+		t.Fatalf("expected \"null\" origin to be accepted, got %v", err)
+	}
+}
+
+func TestParse_CORS_InvalidMethod(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CORS = CORSConfig{
+		Enabled:        true,
+		AllowedOrigins: []string{"https://app.example.com"},
+		AllowedMethods: []string{"GET", "TRACE"},
+	}
+	if _, err := Parse(cfg); err == nil {
+		t.Fatal("expected error for TRACE method")
+	}
+}
+
+func TestParse_CORS_InvalidHeaderName(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CORS = CORSConfig{
+		Enabled:        true,
+		AllowedOrigins: []string{"https://app.example.com"},
+		AllowedHeaders: []string{"Content Type"}, // space is invalid
+	}
+	if _, err := Parse(cfg); err == nil {
+		t.Fatal("expected error for invalid header name")
+	}
+}
+
+func TestParse_CORS_InvalidMaxAge(t *testing.T) {
+	tests := []struct {
+		name   string
+		maxAge string
+	}{
+		{"garbage", "not-a-duration"},
+		{"negative", "-5s"},
+		{"excessive", "100h"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.CORS = CORSConfig{
+				Enabled:        true,
+				AllowedOrigins: []string{"https://app.example.com"},
+				MaxAge:         tt.maxAge,
+			}
+			if _, err := Parse(cfg); err == nil {
+				t.Fatalf("expected error for max_age %q", tt.maxAge)
+			}
+		})
+	}
+}
+
+func TestParse_CORS_HeaderWildcard(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CORS = CORSConfig{
+		Enabled:        true,
+		AllowedOrigins: []string{"https://app.example.com"},
+		AllowedHeaders: []string{"*"},
+	}
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.CORS.AllowedHeaders != "*" {
+		t.Errorf("AllowedHeaders = %q, want \"*\"", parsed.CORS.AllowedHeaders)
+	}
+}
+
+func TestParse_CORS_ZeroMaxAgeOmitted(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CORS = CORSConfig{
+		Enabled:        true,
+		AllowedOrigins: []string{"https://app.example.com"},
+	}
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.CORS.MaxAgeSeconds != 0 {
+		t.Errorf("MaxAgeSeconds = %d, want 0 when unset", parsed.CORS.MaxAgeSeconds)
+	}
+}
+
+func TestParse_CORS_NullOriginWithCredentialsRejected(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CORS = CORSConfig{
+		Enabled:          true,
+		AllowedOrigins:   []string{"https://app.example.com", "null"},
+		AllowCredentials: true,
+	}
+	_, err := Parse(cfg)
+	if err == nil {
+		t.Fatal("expected error combining \"null\" origin with allow_credentials")
+	}
+}
+
+func TestParse_CORS_NullOriginWithoutCredentialsAllowed(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CORS = CORSConfig{
+		Enabled:        true,
+		AllowedOrigins: []string{"null"},
+	}
+	if _, err := Parse(cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestParse_CORS_OriginsLowercased(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CORS = CORSConfig{
+		Enabled:        true,
+		AllowedOrigins: []string{"HTTPS://App.Example.COM"},
+	}
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := parsed.CORS.AllowedOrigins["https://app.example.com"]; !ok {
+		t.Errorf("expected origin to be lowercased in allowlist, got keys: %v", parsed.CORS.AllowedOrigins)
+	}
+}
+
+func TestParse_CORS_HeaderListTrimmed(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CORS = CORSConfig{
+		Enabled:        true,
+		AllowedOrigins: []string{"https://app.example.com"},
+		AllowedHeaders: []string{"  Authorization  ", " Content-Type "},
+	}
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "Authorization, Content-Type"
+	if parsed.CORS.AllowedHeaders != want {
+		t.Errorf("AllowedHeaders = %q, want %q", parsed.CORS.AllowedHeaders, want)
+	}
+}
+
+func TestParse_CORS_ConflictWithResponseHeaders(t *testing.T) {
+	tests := []string{
+		"Access-Control-Allow-Origin",
+		"access-control-allow-credentials",
+		"ACCESS-CONTROL-EXPOSE-HEADERS",
+	}
+	for _, name := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.ResponseHeaders = map[string]string{name: "*"}
+			cfg.CORS = CORSConfig{
+				Enabled:        true,
+				AllowedOrigins: []string{"https://app.example.com"},
+			}
+			if _, err := Parse(cfg); err == nil {
+				t.Fatalf("expected error for response_headers %q combined with enabled CORS", name)
+			}
+		})
+	}
+}
+
+func TestParse_CORS_ResponseHeadersOKWhenCORSDisabled(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ResponseHeaders = map[string]string{"Access-Control-Allow-Origin": "*"}
+	if _, err := Parse(cfg); err != nil {
+		t.Fatalf("unexpected error with CORS disabled: %v", err)
+	}
+}
+
+func TestParse_CORS_MaxAgeDurationConversion(t *testing.T) {
+	cases := []struct {
+		input string
+		want  int
+	}{
+		{"30s", 30},
+		{"10m", 600},
+		{"1h", 3600},
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.CORS = CORSConfig{
+				Enabled:        true,
+				AllowedOrigins: []string{"https://app.example.com"},
+				MaxAge:         tc.input,
+			}
+			parsed, err := Parse(cfg)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if parsed.CORS.MaxAgeSeconds != tc.want {
+				t.Errorf("MaxAgeSeconds = %d, want %d", parsed.CORS.MaxAgeSeconds, tc.want)
+			}
+		})
+	}
+}
+

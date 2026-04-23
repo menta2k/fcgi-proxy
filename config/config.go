@@ -26,6 +26,19 @@ type Config struct {
 	PoolIdleTimeout string            `json:"pool_idle_timeout"`
 	ResponseHeaders map[string]string `json:"response_headers"`
 	Locations       []LocationConfig  `json:"locations"`
+	CORS            CORSConfig        `json:"cors"`
+}
+
+// CORSConfig defines Cross-Origin Resource Sharing rules.
+// When Enabled is false, no CORS headers are emitted and preflights are not handled.
+type CORSConfig struct {
+	Enabled          bool     `json:"enabled"`
+	AllowedOrigins   []string `json:"allowed_origins"`
+	AllowedMethods   []string `json:"allowed_methods"`
+	AllowedHeaders   []string `json:"allowed_headers"`
+	ExposedHeaders   []string `json:"exposed_headers"`
+	AllowCredentials bool     `json:"allow_credentials"`
+	MaxAge           string   `json:"max_age"`
 }
 
 // LocationConfig defines an external proxy location with caching.
@@ -58,6 +71,19 @@ type Parsed struct {
 	PoolIdleTimeout time.Duration
 	ResponseHeaders map[string]string
 	Locations       []ParsedLocation
+	CORS            ParsedCORS
+}
+
+// ParsedCORS holds validated CORS settings with pre-built header values.
+type ParsedCORS struct {
+	Enabled          bool
+	AllowAllOrigins  bool                // true if "*" is configured (implies !AllowCredentials)
+	AllowedOrigins   map[string]struct{} // exact-match allowlist (empty when AllowAllOrigins)
+	AllowedMethods   string              // comma-joined, ready for Access-Control-Allow-Methods
+	AllowedHeaders   string              // comma-joined, ready for Access-Control-Allow-Headers
+	ExposedHeaders   string              // comma-joined, ready for Access-Control-Expose-Headers
+	AllowCredentials bool
+	MaxAgeSeconds    int // 0 means omit the header
 }
 
 const (
@@ -211,6 +237,23 @@ func Parse(cfg Config) (Parsed, error) {
 		return Parsed{}, fmt.Errorf("config: pool_idle_timeout must be between 1s and %v, got %v", maxTimeout, poolIdleTimeout)
 	}
 
+	parsedCORS, err := parseCORS(cfg.CORS)
+	if err != nil {
+		return Parsed{}, err
+	}
+
+	// Prevent silent conflict between the generic response_headers injector and
+	// the CORS middleware. When both are configured, the middleware overwrites
+	// any overlapping Access-Control-* header from response_headers, which
+	// violates operator intent.
+	if parsedCORS.Enabled {
+		for k := range cfg.ResponseHeaders {
+			if hasCORSHeaderPrefix(k) {
+				return Parsed{}, fmt.Errorf("config: response_headers must not set %q when cors.enabled is true (CORS middleware is authoritative)", k)
+			}
+		}
+	}
+
 	return Parsed{
 		Listen:         cfg.Listen,
 		Network:        cfg.Network,
@@ -226,7 +269,206 @@ func Parse(cfg Config) (Parsed, error) {
 		PoolIdleTimeout: poolIdleTimeout,
 		ResponseHeaders: cfg.ResponseHeaders,
 		Locations:       parsedLocations,
+		CORS:            parsedCORS,
 	}, nil
+}
+
+const (
+	maxCORSMaxAge   = 24 * time.Hour
+	maxCORSListSize = 64
+)
+
+// validHTTPMethods is the allow-set for CORS method validation.
+// Case-insensitive; normalized to upper-case in ParsedCORS.
+var validHTTPMethods = map[string]bool{
+	"GET":     true,
+	"HEAD":    true,
+	"POST":    true,
+	"PUT":     true,
+	"PATCH":   true,
+	"DELETE":  true,
+	"OPTIONS": true,
+}
+
+// parseCORS validates a CORSConfig and returns a ParsedCORS.
+func parseCORS(c CORSConfig) (ParsedCORS, error) {
+	if !c.Enabled {
+		return ParsedCORS{Enabled: false}, nil
+	}
+
+	if len(c.AllowedOrigins) == 0 {
+		return ParsedCORS{}, fmt.Errorf("config: cors.allowed_origins must not be empty when cors is enabled")
+	}
+	if len(c.AllowedOrigins) > maxCORSListSize {
+		return ParsedCORS{}, fmt.Errorf("config: cors.allowed_origins has too many entries (max %d)", maxCORSListSize)
+	}
+
+	origins := make(map[string]struct{}, len(c.AllowedOrigins))
+	allowAll := false
+	hasNull := false
+	for _, o := range c.AllowedOrigins {
+		o = strings.TrimSpace(o)
+		if o == "" {
+			return ParsedCORS{}, fmt.Errorf("config: cors.allowed_origins contains an empty entry")
+		}
+		if o == "*" {
+			allowAll = true
+			continue
+		}
+		if err := validateOrigin(o); err != nil {
+			return ParsedCORS{}, fmt.Errorf("config: cors.allowed_origins entry %q is invalid: %w", o, err)
+		}
+		if o == "null" {
+			hasNull = true
+		}
+		// Normalize scheme+host to lowercase per RFC 6454 §6.2 so request-time
+		// lookups can use a zero-alloc map hit via the Go compiler's
+		// m[string(byteSlice)] optimization.
+		origins[strings.ToLower(o)] = struct{}{}
+	}
+
+	if allowAll && len(origins) > 0 {
+		return ParsedCORS{}, fmt.Errorf("config: cors.allowed_origins cannot mix \"*\" with explicit origins")
+	}
+	if allowAll && c.AllowCredentials {
+		return ParsedCORS{}, fmt.Errorf("config: cors.allow_credentials cannot be true when cors.allowed_origins is \"*\"")
+	}
+	if hasNull && c.AllowCredentials {
+		// "null" is sent by sandboxed iframes, file://, data:, and some redirect
+		// chains — any attacker-controlled page can produce it. Echoing it back
+		// with Allow-Credentials: true is the CORS anti-pattern.
+		return ParsedCORS{}, fmt.Errorf("config: cors.allow_credentials cannot be true when \"null\" is in cors.allowed_origins")
+	}
+
+	methods, err := parseCORSMethods(c.AllowedMethods)
+	if err != nil {
+		return ParsedCORS{}, err
+	}
+	headers, err := parseCORSHeaderList(c.AllowedHeaders, "allowed_headers")
+	if err != nil {
+		return ParsedCORS{}, err
+	}
+	exposed, err := parseCORSHeaderList(c.ExposedHeaders, "exposed_headers")
+	if err != nil {
+		return ParsedCORS{}, err
+	}
+
+	maxAgeSec := 0
+	if c.MaxAge != "" {
+		d, parseErr := time.ParseDuration(c.MaxAge)
+		if parseErr != nil {
+			return ParsedCORS{}, fmt.Errorf("config: invalid cors.max_age %q: %w", c.MaxAge, parseErr)
+		}
+		if d < 0 {
+			return ParsedCORS{}, fmt.Errorf("config: cors.max_age must not be negative, got %v", d)
+		}
+		if d > maxCORSMaxAge {
+			return ParsedCORS{}, fmt.Errorf("config: cors.max_age must not exceed %v, got %v", maxCORSMaxAge, d)
+		}
+		maxAgeSec = int(d.Seconds())
+	}
+
+	return ParsedCORS{
+		Enabled:          true,
+		AllowAllOrigins:  allowAll,
+		AllowedOrigins:   origins,
+		AllowedMethods:   methods,
+		AllowedHeaders:   headers,
+		ExposedHeaders:   exposed,
+		AllowCredentials: c.AllowCredentials,
+		MaxAgeSeconds:    maxAgeSec,
+	}, nil
+}
+
+// hasCORSHeaderPrefix reports whether a header name begins with "Access-Control-",
+// case-insensitive, without allocating a lowercased copy.
+func hasCORSHeaderPrefix(name string) bool {
+	const prefix = "access-control-"
+	if len(name) < len(prefix) {
+		return false
+	}
+	for i := range len(prefix) {
+		c := name[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != prefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// validateOrigin checks that an origin has the form scheme://host[:port] with no path.
+// Scheme is compared case-insensitively per RFC 6454 §6.2.
+func validateOrigin(origin string) error {
+	if origin == "null" {
+		// "null" is a valid Origin for sandboxed iframes/file://; allow it.
+		return nil
+	}
+	if strings.ContainsAny(origin, " \t\r\n\x00") {
+		return fmt.Errorf("contains whitespace or control characters")
+	}
+	scheme, rest, ok := strings.Cut(origin, "://")
+	if !ok {
+		return fmt.Errorf("missing scheme (expected scheme://host)")
+	}
+	switch strings.ToLower(scheme) {
+	case "http", "https":
+	default:
+		return fmt.Errorf("scheme must be http or https, got %q", scheme)
+	}
+	if rest == "" {
+		return fmt.Errorf("missing host")
+	}
+	if strings.ContainsAny(rest, "/?#") {
+		return fmt.Errorf("must not contain a path, query, or fragment")
+	}
+	return nil
+}
+
+func parseCORSMethods(methods []string) (string, error) {
+	if len(methods) == 0 {
+		return "", nil
+	}
+	if len(methods) > maxCORSListSize {
+		return "", fmt.Errorf("config: cors.allowed_methods has too many entries (max %d)", maxCORSListSize)
+	}
+	upper := make([]string, 0, len(methods))
+	for _, m := range methods {
+		m = strings.TrimSpace(strings.ToUpper(m))
+		if m == "" {
+			return "", fmt.Errorf("config: cors.allowed_methods contains an empty entry")
+		}
+		if !validHTTPMethods[m] {
+			return "", fmt.Errorf("config: cors.allowed_methods entry %q is not a recognized HTTP method", m)
+		}
+		upper = append(upper, m)
+	}
+	return strings.Join(upper, ", "), nil
+}
+
+func parseCORSHeaderList(headers []string, field string) (string, error) {
+	if len(headers) == 0 {
+		return "", nil
+	}
+	if len(headers) > maxCORSListSize {
+		return "", fmt.Errorf("config: cors.%s has too many entries (max %d)", field, maxCORSListSize)
+	}
+	trimmed := make([]string, 0, len(headers))
+	for _, h := range headers {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			return "", fmt.Errorf("config: cors.%s contains an empty entry", field)
+		}
+		if h != "*" && !isValidHeaderName(h) {
+			// Wildcard is allowed by the CORS spec but only meaningful without
+			// credentials — callers should avoid combining them.
+			return "", fmt.Errorf("config: cors.%s entry %q is not a valid header name", field, h)
+		}
+		trimmed = append(trimmed, h)
+	}
+	return strings.Join(trimmed, ", "), nil
 }
 
 // isValidHeaderName checks that s is a valid HTTP header field name (RFC 7230 token).

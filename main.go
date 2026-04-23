@@ -69,6 +69,7 @@ func main() {
 		WriteTimeout:    parsed.WriteTimeout,
 		ResponseHeaders: parsed.ResponseHeaders,
 		Locations:       locations,
+		CORS:            parsed.CORS,
 		Pool: fcgi.PoolConfig{
 			MaxIdle:     parsed.PoolMaxIdle,
 			IdleTimeout: parsed.PoolIdleTimeout,
