@@ -17,6 +17,9 @@ spec:
       labels:
         {{- include "fcgi-proxy-example.selectorLabels" . | nindent 8 }}
     spec:
+      # Give the proxy time to bleed off in-flight requests after preStop
+      # flips /readyz to 503 and the service endpoint is withdrawn.
+      terminationGracePeriodSeconds: 45
       containers:
         # PHP-FPM — the FastCGI backend
         - name: php-fpm
@@ -62,6 +65,18 @@ spec:
               port: http
             initialDelaySeconds: 1
             periodSeconds: 5
+          # Graceful drain: on pod termination, flip /readyz to 503 before
+          # the container actually exits. The endpoints controller then
+          # removes this pod from the Service, and subsequent responses
+          # carry Connection: close so keepalive clients rotate away. The
+          # sleep gives the LB time to observe the readiness flip.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - 'wget -qO- http://127.0.0.1:{{ .Values.proxy.port }}/healthz/fail || true; sleep 15'
           volumeMounts:
             - name: proxy-config
               mountPath: /etc/fcgi-proxy

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1042,6 +1043,81 @@ func TestParse_Readiness_InvalidTimeoutFormat(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "readiness.timeout") {
 		t.Errorf("error = %v, want mention of readiness.timeout", err)
+	}
+}
+
+func TestParse_Readiness_DrainTrustedCIDRs_Default(t *testing.T) {
+	cfg := DefaultConfig()
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(parsed.Readiness.DrainTrustedCIDRs) != 2 {
+		t.Fatalf("default CIDR count = %d, want 2 (v4+v6 loopback)", len(parsed.Readiness.DrainTrustedCIDRs))
+	}
+	// Verify loopback IPs pass the default allowlist.
+	for _, ip := range []string{"127.0.0.1", "127.1.2.3", "::1"} {
+		matched := false
+		for _, n := range parsed.Readiness.DrainTrustedCIDRs {
+			if n.Contains(net.ParseIP(ip)) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Errorf("default CIDRs must match %s", ip)
+		}
+	}
+}
+
+func TestParse_Readiness_DrainTrustedCIDRs_Custom(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Readiness.DrainTrustedCIDRs = []string{"10.0.0.0/8", "192.168.1.0/24"}
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(parsed.Readiness.DrainTrustedCIDRs) != 2 {
+		t.Fatalf("CIDR count = %d, want 2", len(parsed.Readiness.DrainTrustedCIDRs))
+	}
+}
+
+func TestParse_Readiness_DrainTrustedCIDRs_EmptyOptOut(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Readiness.DrainTrustedCIDRs = []string{}
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.Readiness.DrainTrustedCIDRs == nil {
+		t.Error("explicit empty slice must round-trip as non-nil empty slice")
+	}
+	if len(parsed.Readiness.DrainTrustedCIDRs) != 0 {
+		t.Errorf("len = %d, want 0", len(parsed.Readiness.DrainTrustedCIDRs))
+	}
+}
+
+func TestParse_Readiness_DrainTrustedCIDRs_Invalid(t *testing.T) {
+	cases := []struct {
+		name string
+		cidr string
+	}{
+		{"not_cidr", "127.0.0.1"},   // missing /N
+		{"bad_mask", "127.0.0.0/33"}, // mask too large for IPv4
+		{"garbage", "not-an-ip"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Readiness.DrainTrustedCIDRs = []string{tc.cidr}
+			_, err := Parse(cfg)
+			if err == nil {
+				t.Fatalf("expected error for %q", tc.cidr)
+			}
+			if !strings.Contains(err.Error(), "drain_trusted_cidrs") {
+				t.Errorf("error = %v, want mention of drain_trusted_cidrs", err)
+			}
+		})
 	}
 }
 

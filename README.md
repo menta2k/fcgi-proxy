@@ -31,8 +31,8 @@ A high-performance reverse proxy that sits in front of FastCGI servers like PHP-
 - Null byte rejection in URI path and query string
 - Authoritative `X-Forwarded-For` / `X-Real-IP` injection (client-supplied values stripped)
 - Configurable timeouts, body size limits, and concurrency caps
-- Health endpoints: `/healthz` (liveness) and `/readyz` (readiness — probes PHP-FPM's status page)
-- Graceful shutdown on SIGINT/SIGTERM
+- Health endpoints: `/healthz` (liveness), `/readyz` (readiness — probes PHP-FPM's status page), `/healthz/fail` (graceful drain trigger)
+- Graceful shutdown on SIGINT/SIGTERM, plus Kubernetes-friendly drain via `/healthz/fail` (flips readiness + `Connection: close`)
 
 ## Quick Start
 
@@ -527,6 +527,34 @@ Behavior notes:
 ; /usr/local/etc/php-fpm.d/www.conf
 pm.status_path = /status
 ```
+
+### `GET|POST /healthz/fail` — trigger graceful drain
+
+Sets the proxy to draining mode. Once triggered:
+
+- **`/readyz` flips to `503` / body `draining`** without probing upstream — Kubernetes removes the pod from the Service endpoints.
+- **Every HTTP/1 response gets `Connection: close`** — load balancers and keepalive clients rotate away before the pod dies.
+- **`/healthz` stays `200`** so Kubernetes liveness does not restart the pod mid-drain.
+- **Idempotent** — repeat calls return `200 draining` without side effects.
+
+Wire this from a Kubernetes `preStop` hook so the pod bleeds off in-flight requests cleanly:
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh", "-c", "wget -qO- http://127.0.0.1:8080/healthz/fail || true; sleep 15"]
+```
+
+Combine with `terminationGracePeriodSeconds` greater than your longest request plus the preStop sleep (example uses 45s).
+
+### `GET /healthz/drain-status` — observability
+
+Returns `live` or `draining` so operators can confirm the preStop hook reached the proxy.
+
+**Disable with `readiness.drain_enabled: false`.** `/healthz/fail` then returns `404` so an operator who wires the hook without enabling the feature finds out immediately instead of silently shipping no-op traffic.
+
+**Security — IP allowlist:** `/healthz/fail` enforces `readiness.drain_trusted_cidrs` (default `["127.0.0.0/8", "::1/128"]`). Non-matching remotes get `403 forbidden`. This is defence-in-depth; path-level isolation at the ingress/NetworkPolicy is still the primary mitigation. Set the list to `[]` to disable the check, or add CNI/pod ranges if drain is coordinated from a sibling pod. The `/healthz/drain-status` endpoint is intentionally unrestricted — it only reports a state `/readyz` already reveals.
 
 ## Performance
 

@@ -124,8 +124,19 @@ func probeError(resp fcgi.Response, err error) error {
 // handleReadiness answers /readyz. The PHP-FPM status body is drained and
 // never echoed — the endpoint is meant for k8s probes and must not leak
 // worker-pool internals to arbitrary callers.
-func handleReadiness(ctx *fasthttp.RequestCtx, prober *readinessProber) {
+//
+// When drain is non-nil and marked, the handler short-circuits to 503
+// without probing upstream. The pod is going away: PHP-FPM's state is
+// irrelevant, and skipping the probe avoids flagging the upstream as
+// unhealthy for a reason that's actually us.
+func handleReadiness(ctx *fasthttp.RequestCtx, prober *readinessProber, drain *drainState) {
 	ctx.SetContentType("text/plain")
+
+	if drain != nil && drain.isDraining() {
+		ctx.SetStatusCode(fasthttp.StatusServiceUnavailable)
+		ctx.SetBodyString("draining")
+		return
+	}
 
 	if prober == nil {
 		// Readiness disabled: fall back to a liveness-style OK so a

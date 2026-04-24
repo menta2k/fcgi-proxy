@@ -32,6 +32,17 @@ service:
   port: 80
 
 ingress:
+  # WARNING: enabling ingress with a `/` Prefix rule exposes /healthz/fail
+  # and /healthz/drain-status alongside the app. /healthz/fail takes the pod
+  # out of rotation on a single GET — it must stay unreachable from the
+  # public internet. Either:
+  #   - restrict ingress paths to app routes (not /), OR
+  #   - block /healthz/* at the ingress controller (e.g., nginx annotation
+  #     nginx.ingress.kubernetes.io/server-snippet: 'location ~ ^/healthz { return 404; }'), OR
+  #   - keep ingress disabled and rely on a dedicated Service for app traffic.
+  # The proxy's built-in IP allowlist (readiness.drain_trusted_cidrs) defaults
+  # to loopback only and is a second line of defence, not a substitute for
+  # path-level isolation at the edge.
   enabled: false
   className: ""
   annotations: {}
@@ -68,10 +79,22 @@ config:
   # built-in status path (pm.status_path). Enable pm.status_path in your
   # PHP-FPM pool config (typically /status) for this to work.
   # /healthz stays as a dependency-free liveness check.
+  #
+  # drain_enabled exposes /healthz/fail (GET or POST) as a graceful-drain
+  # trigger. Wire it from a preStop hook so the pod flips /readyz to 503
+  # and sets Connection: close on every HTTP/1 response before shutdown.
+  # drain_trusted_cidrs restricts which remote IPs may trigger drain. Default
+  # is loopback only so the preStop hook on 127.0.0.1 works while a
+  # misconfigured ingress cannot take the pod out of rotation. Use [] to
+  # disable the check, or add CNI ranges for sibling-pod coordination.
   readiness:
     enabled: true
     status_path: "/status"
     timeout: "1s"
+    drain_enabled: true
+    drain_trusted_cidrs:
+      - "127.0.0.0/8"
+      - "::1/128"
 
   # Headers injected on every proxied response.
   response_headers:

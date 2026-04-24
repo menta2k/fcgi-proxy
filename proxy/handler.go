@@ -130,9 +130,32 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 	// reused across every /readyz request. Nil when readiness is disabled.
 	prober := newReadinessProber(cfg)
 
+	// Drain state is allocated once per Handler and shared across every
+	// request. Nil when drain is disabled — /healthz/fail then 404s so an
+	// operator who thinks drain is wired up finds out immediately.
+	var drain *drainState
+	if cfg.Readiness.DrainEnabled {
+		drain = &drainState{trustedCIDRs: cfg.Readiness.DrainTrustedCIDRs}
+	}
+
 	cleanDocRoot := filepath.Clean(cfg.DocumentRoot)
 
 	return func(ctx *fasthttp.RequestCtx) {
+		// Once draining, every HTTP/1 response carries Connection: close so
+		// load balancers rotate keepalive clients away before the pod dies.
+		// fasthttp also closes the TCP connection after the response is
+		// written. Deferred so the flag applies to every return path —
+		// including CORS preflights, health endpoints, and upstream proxies.
+		// The CORS-preflight case is intentional: browsers seeing the close
+		// header on a preflight will open a fresh connection for the real
+		// request, which is also correct during drain (the new connection
+		// lands on a non-draining pod once the LB rotates).
+		defer func() {
+			if drain != nil && drain.isDraining() {
+				ctx.SetConnectionClose()
+			}
+		}()
+
 		// CORS runs first so preflights are answered without touching the
 		// upstream and so every response path can receive CORS headers.
 		corsResult := handleCORS(ctx, cfg.CORS)
@@ -142,12 +165,29 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 
 		uriPath := string(ctx.URI().Path())
 
+		// Drain trigger and status must be checked before /healthz so the
+		// longest-prefix match wins. These endpoints bypass auth and CORS
+		// headers the same way /healthz does.
+		if uriPath == "/healthz/fail" {
+			handleDrainFail(ctx, drain)
+			applyCORSResponseHeaders(ctx, cfg.CORS, corsResult)
+			return
+		}
+		if uriPath == "/healthz/drain-status" {
+			handleDrainStatus(ctx, drain)
+			applyCORSResponseHeaders(ctx, cfg.CORS, corsResult)
+			return
+		}
+
 		// Liveness endpoint — responds without touching the upstream. Answers
 		// only "is the proxy process alive?"; dependency on PHP-FPM is
 		// intentionally not checked here so a temporarily-down upstream
 		// doesn't cause Kubernetes to kill the pod.
 		// Intentionally skips response_headers injection (health checks go to
 		// load balancers, not browsers — security headers are not needed here).
+		//
+		// Stays 200 even while draining: flipping liveness to fail would make
+		// k8s restart the pod mid-drain, which is the opposite of graceful.
 		if uriPath == "/healthz" {
 			ctx.SetStatusCode(fasthttp.StatusOK)
 			ctx.SetContentType("text/plain")
@@ -158,9 +198,10 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 
 		// Readiness endpoint — probes the PHP-FPM status page to confirm
 		// the upstream is accepting requests. Failure returns 503 so k8s
-		// stops routing traffic without restarting the pod.
+		// stops routing traffic without restarting the pod. While draining,
+		// readiness short-circuits to 503 without probing.
 		if uriPath == "/readyz" {
-			handleReadiness(ctx, prober)
+			handleReadiness(ctx, prober, drain)
 			applyCORSResponseHeaders(ctx, cfg.CORS, corsResult)
 			return
 		}

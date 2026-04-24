@@ -39,6 +39,17 @@ type ReadinessConfig struct {
 	Enabled    bool   `json:"enabled"`
 	StatusPath string `json:"status_path"` // PHP-FPM's pm.status_path, default "/status"
 	Timeout    string `json:"timeout"`     // per-probe deadline, default "1s"
+	// DrainEnabled turns on the /healthz/fail endpoint used to trigger a
+	// graceful drain. While draining, /readyz returns 503 and every
+	// HTTP/1 response carries Connection: close so load balancers rotate
+	// clients away. Defaults to true when readiness itself is enabled.
+	DrainEnabled bool `json:"drain_enabled"`
+	// DrainTrustedCIDRs restricts which remote IPs may call /healthz/fail.
+	// Default (loopback only) ensures a k8s preStop hook on 127.0.0.1 works
+	// while an accidentally-exposed ingress cannot trigger drain. Use an
+	// explicit empty list ([]) to disable the check, or add pod/CNI ranges
+	// if drain is coordinated from a sibling pod.
+	DrainTrustedCIDRs []string `json:"drain_trusted_cidrs"`
 }
 
 // CORSConfig defines Cross-Origin Resource Sharing rules.
@@ -111,9 +122,11 @@ type Parsed struct {
 
 // ParsedReadiness holds validated readiness probe settings.
 type ParsedReadiness struct {
-	Enabled    bool
-	StatusPath string
-	Timeout    time.Duration
+	Enabled           bool
+	StatusPath        string
+	Timeout           time.Duration
+	DrainEnabled      bool
+	DrainTrustedCIDRs []*net.IPNet
 }
 
 // ParsedCORS holds validated CORS settings with pre-built header values.
@@ -164,9 +177,11 @@ func DefaultConfig() Config {
 		PoolMaxIdle:     32,
 		PoolIdleTimeout: "30s",
 		Readiness: ReadinessConfig{
-			Enabled:    true,
-			StatusPath: "/status",
-			Timeout:    "1s",
+			Enabled:           true,
+			StatusPath:        "/status",
+			Timeout:           "1s",
+			DrainEnabled:      true,
+			DrainTrustedCIDRs: []string{"127.0.0.0/8", "::1/128"},
 		},
 	}
 }
@@ -388,11 +403,38 @@ func parseReadiness(cfg ReadinessConfig) (ParsedReadiness, error) {
 		return ParsedReadiness{}, fmt.Errorf("config: readiness.timeout must be between 100ms and 30s, got %v", timeout)
 	}
 
+	trustedCIDRs, err := parseDrainCIDRs(cfg.DrainTrustedCIDRs)
+	if err != nil {
+		return ParsedReadiness{}, err
+	}
+
 	return ParsedReadiness{
-		Enabled:    true,
-		StatusPath: statusPath,
-		Timeout:    timeout,
+		Enabled:           true,
+		StatusPath:        statusPath,
+		Timeout:           timeout,
+		DrainEnabled:      cfg.DrainEnabled,
+		DrainTrustedCIDRs: trustedCIDRs,
 	}, nil
+}
+
+// parseDrainCIDRs validates each CIDR string and returns the parsed nets.
+// An explicitly empty (non-nil) list disables the filter and is returned as
+// a non-nil empty slice so the handler can distinguish "unset -> default"
+// from "operator opted out". A nil input also returns nil, letting the
+// handler apply its default-deny behavior.
+func parseDrainCIDRs(raw []string) ([]*net.IPNet, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	nets := make([]*net.IPNet, 0, len(raw))
+	for i, s := range raw {
+		_, n, err := net.ParseCIDR(s)
+		if err != nil {
+			return nil, fmt.Errorf("config: readiness.drain_trusted_cidrs[%d]=%q: %w", i, s, err)
+		}
+		nets = append(nets, n)
+	}
+	return nets, nil
 }
 
 const (

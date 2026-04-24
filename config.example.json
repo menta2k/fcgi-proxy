@@ -14,7 +14,9 @@
   "readiness": {
     "enabled": true,
     "status_path": "/status",
-    "timeout": "1s"
+    "timeout": "1s",
+    "drain_enabled": true,
+    "drain_trusted_cidrs": ["127.0.0.0/8", "::1/128"]
   },
   "response_headers": {
     "X-Content-Type-Options": "nosniff",
