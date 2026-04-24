@@ -954,3 +954,117 @@ func TestParse_CORS_MaxAgeDurationConversion(t *testing.T) {
 	}
 }
 
+func TestParse_Readiness_Disabled(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Readiness = ReadinessConfig{Enabled: false, StatusPath: "/ignored", Timeout: "bad"}
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error when readiness disabled: %v", err)
+	}
+	if parsed.Readiness.Enabled {
+		t.Errorf("Enabled = true, want false")
+	}
+	// When disabled, invalid fields are ignored and zero-valued.
+	if parsed.Readiness.StatusPath != "" || parsed.Readiness.Timeout != 0 {
+		t.Errorf("disabled readiness must be zero-valued, got %+v", parsed.Readiness)
+	}
+}
+
+func TestParse_Readiness_DefaultsFromEmptyFields(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Readiness = ReadinessConfig{Enabled: true, StatusPath: "", Timeout: ""}
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.Readiness.StatusPath != "/status" {
+		t.Errorf("StatusPath = %q, want /status", parsed.Readiness.StatusPath)
+	}
+	if parsed.Readiness.Timeout != time.Second {
+		t.Errorf("Timeout = %v, want 1s", parsed.Readiness.Timeout)
+	}
+}
+
+func TestParse_Readiness_CustomValues(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Readiness = ReadinessConfig{Enabled: true, StatusPath: "/fpm-status", Timeout: "500ms"}
+	parsed, err := Parse(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.Readiness.StatusPath != "/fpm-status" {
+		t.Errorf("StatusPath = %q, want /fpm-status", parsed.Readiness.StatusPath)
+	}
+	if parsed.Readiness.Timeout != 500*time.Millisecond {
+		t.Errorf("Timeout = %v, want 500ms", parsed.Readiness.Timeout)
+	}
+}
+
+func TestParse_Readiness_StatusPathMissingLeadingSlash(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Readiness = ReadinessConfig{Enabled: true, StatusPath: "status", Timeout: "1s"}
+	_, err := Parse(cfg)
+	if err == nil {
+		t.Fatal("expected error for status_path without leading slash")
+	}
+	if !strings.Contains(err.Error(), "status_path") {
+		t.Errorf("error = %v, want mention of status_path", err)
+	}
+}
+
+func TestParse_Readiness_StatusPathControlChars(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"cr", "/status\r"},
+		{"lf", "/status\n"},
+		{"null", "/status\x00"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Readiness = ReadinessConfig{Enabled: true, StatusPath: tc.path, Timeout: "1s"}
+			_, err := Parse(cfg)
+			if err == nil {
+				t.Fatal("expected error for control character in status_path")
+			}
+		})
+	}
+}
+
+func TestParse_Readiness_InvalidTimeoutFormat(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Readiness = ReadinessConfig{Enabled: true, StatusPath: "/status", Timeout: "not-a-duration"}
+	_, err := Parse(cfg)
+	if err == nil {
+		t.Fatal("expected error for invalid timeout format")
+	}
+	if !strings.Contains(err.Error(), "readiness.timeout") {
+		t.Errorf("error = %v, want mention of readiness.timeout", err)
+	}
+}
+
+func TestParse_Readiness_TimeoutOutOfRange(t *testing.T) {
+	cases := []struct {
+		name    string
+		timeout string
+	}{
+		{"too_small", "50ms"},
+		{"too_large", "60s"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Readiness = ReadinessConfig{Enabled: true, StatusPath: "/status", Timeout: tc.timeout}
+			_, err := Parse(cfg)
+			if err == nil {
+				t.Fatal("expected out-of-range error")
+			}
+			if !strings.Contains(err.Error(), "100ms and 30s") {
+				t.Errorf("error = %v, want mention of allowed range", err)
+			}
+		})
+	}
+}
+

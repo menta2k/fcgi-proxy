@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"errors"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -281,3 +283,142 @@ type fakeAddr struct{ s string }
 
 func (f *fakeAddr) Network() string { return "tcp" }
 func (f *fakeAddr) String() string  { return f.s }
+
+// TestNewReadinessProber_Disabled verifies that readiness.enabled=false
+// produces a nil prober (signalling "no probing" to the handler).
+func TestNewReadinessProber_Disabled(t *testing.T) {
+	cfg := Config{
+		Network: "tcp",
+		Address: "127.0.0.1:9000",
+		Readiness: config.ParsedReadiness{
+			Enabled: false,
+		},
+	}
+	if p := newReadinessProber(cfg); p != nil {
+		t.Errorf("expected nil prober when readiness disabled, got %+v", p)
+	}
+}
+
+// TestReadinessProber_Close verifies close() is safe to call and tolerates
+// a nil client (the prober constructor always sets one, but defensive code
+// should survive a zero value too).
+func TestReadinessProber_Close(t *testing.T) {
+	cfg := Config{
+		Network: "tcp",
+		Address: "127.0.0.1:9000",
+		Readiness: config.ParsedReadiness{
+			Enabled:    true,
+			StatusPath: "/status",
+			Timeout:    500 * time.Millisecond,
+		},
+	}
+	p := newReadinessProber(cfg)
+	if p == nil {
+		t.Fatal("expected non-nil prober")
+	}
+	p.close() // must not panic
+	// Zero-value prober (no client) must also close cleanly.
+	(&readinessProber{}).close()
+}
+
+// TestProbeError_AllPaths exercises each branch of probeError directly,
+// including the "success" branch that the retry logic never reaches (it
+// only calls probeError when the probe has already failed).
+func TestProbeError_AllPaths(t *testing.T) {
+	t.Run("transport_error", func(t *testing.T) {
+		want := errors.New("dial refused")
+		got := probeError(fcgi.Response{}, want)
+		if got != want {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("success_status_returns_nil", func(t *testing.T) {
+		got := probeError(fcgi.Response{StatusCode: 200}, nil)
+		if got != nil {
+			t.Errorf("got %v, want nil on 2xx", got)
+		}
+	})
+	t.Run("non_success_status", func(t *testing.T) {
+		got := probeError(fcgi.Response{StatusCode: 503}, nil)
+		if got == nil {
+			t.Fatal("expected error for 503 status")
+		}
+		if !strings.Contains(got.Error(), "503") {
+			t.Errorf("error = %v, want mention of 503", got)
+		}
+	})
+}
+
+// TestTruncateErr covers the nil, short, and long cases — the second and
+// third branches are not reliably hit by the end-to-end /readyz tests.
+func TestTruncateErr(t *testing.T) {
+	t.Run("nil", func(t *testing.T) {
+		if got := truncateErr(nil, 10); got != nil {
+			t.Errorf("got %v, want nil", got)
+		}
+	})
+	t.Run("under_limit_returns_original", func(t *testing.T) {
+		orig := errors.New("short")
+		got := truncateErr(orig, 10)
+		if got != orig {
+			t.Errorf("expected original error pointer when under limit, got %v", got)
+		}
+	})
+	t.Run("over_limit_truncates", func(t *testing.T) {
+		long := errors.New(strings.Repeat("x", 500))
+		got := truncateErr(long, 50)
+		if got == nil {
+			t.Fatal("expected non-nil truncated error")
+		}
+		msg := got.Error()
+		// 50 x's + the ellipsis suffix
+		if !strings.HasPrefix(msg, strings.Repeat("x", 50)) {
+			t.Errorf("truncated message missing prefix: %q", msg)
+		}
+		if !strings.HasSuffix(msg, "…") {
+			t.Errorf("truncated message missing ellipsis suffix: %q", msg)
+		}
+		if len(msg) >= len(long.Error()) {
+			t.Errorf("truncated length = %d, want less than original %d", len(msg), len(long.Error()))
+		}
+	})
+}
+
+// TestReadinessProber_BuildParams verifies the CGI params include the
+// configured SCRIPT_FILENAME/SCRIPT_NAME so PHP-FPM routes to its status
+// handler rather than looking for a PHP file on disk.
+func TestReadinessProber_BuildParams(t *testing.T) {
+	cfg := Config{
+		Network:      "tcp",
+		Address:      "127.0.0.1:9000",
+		DocumentRoot: "/srv/app",
+		ListenPort:   "9090",
+		Readiness: config.ParsedReadiness{
+			Enabled:    true,
+			StatusPath: "/fpm-status",
+			Timeout:    500 * time.Millisecond,
+		},
+	}
+	p := newReadinessProber(cfg)
+	if p == nil {
+		t.Fatal("expected non-nil prober")
+	}
+	defer p.close()
+
+	params := p.buildParams()
+	want := map[string]string{
+		"SCRIPT_FILENAME": "/fpm-status",
+		"SCRIPT_NAME":     "/fpm-status",
+		"REQUEST_URI":     "/fpm-status",
+		"DOCUMENT_URI":    "/fpm-status",
+		"DOCUMENT_ROOT":   "/srv/app",
+		"SERVER_PORT":     "9090",
+		"REQUEST_METHOD":  "GET",
+		"SERVER_NAME":     "readyz",
+	}
+	for k, v := range want {
+		if got := params[k]; got != v {
+			t.Errorf("params[%q] = %q, want %q", k, got, v)
+		}
+	}
+}
