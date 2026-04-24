@@ -31,7 +31,7 @@ A high-performance reverse proxy that sits in front of FastCGI servers like PHP-
 - Null byte rejection in URI path and query string
 - Authoritative `X-Forwarded-For` / `X-Real-IP` injection (client-supplied values stripped)
 - Configurable timeouts, body size limits, and concurrency caps
-- Health check endpoint at `/healthz`
+- Health endpoints: `/healthz` (liveness) and `/readyz` (readiness — probes PHP-FPM's status page)
 - Graceful shutdown on SIGINT/SIGTERM
 
 ## Quick Start
@@ -310,7 +310,7 @@ Cross-Origin Resource Sharing handled at the proxy, independently of what the ba
 - **Origin scheme validation**: `http://`, `https://`, `app://`, or literal `"null"`. Anything else is rejected at parse time.
 - **Port validation**: hostnames with a `:port` suffix require a decimal port in `1..65535`. Malformed entries like `app://loc:alhost` are rejected.
 - **Case-insensitive origin matching**: browsers normalize origins to lowercase; the proxy lowercases the configured allowlist at parse time and does a zero-allocation fast path for already-lowercase request origins.
-- **Bypass paths**: `/healthz` and configured `locations` (both static-return and cached-upstream entries) are not CORS-gated. If you need CORS on those paths, handle it upstream.
+- **Bypass paths**: `/healthz`, `/readyz`, and configured `locations` (both static-return and cached-upstream entries) are not CORS-gated. If you need CORS on those paths, handle it upstream.
 
 **Security hardening (already in place):**
 
@@ -360,7 +360,7 @@ HTTP authentication applied at the proxy, in front of the FastCGI backend. Two s
 
 **Bypass paths** (not gated by auth):
 
-- `/healthz` — load-balancer probes stay reachable.
+- `/healthz` and `/readyz` — load-balancer and Kubernetes probes stay reachable.
 - CORS preflight (`OPTIONS` with `Access-Control-Request-Method`) — browsers strip the `Authorization` header from preflights, so gating them would break every CORS-using client. The CORS middleware handles preflights before the auth gate.
 - Configured `locations` — both `return` (inline static) and cached-upstream entries. If a path is in your `locations`, it serves without auth.
 
@@ -496,9 +496,37 @@ At startup, the proxy validates:
 
 Invalid configuration causes the proxy to exit with a clear error message.
 
-## Health Check
+## Health and Readiness Endpoints
 
-`GET /healthz` returns `200 OK` with body `ok` without touching the FastCGI upstream or the location cache. Use this for load balancer and Kubernetes liveness/readiness probes.
+Two separate endpoints, each with a distinct purpose:
+
+### `GET /healthz` — liveness
+
+Returns `200 OK` with body `ok`. Never touches PHP-FPM, the location cache, or authentication. Answers the single question: *is the proxy process still running?* Use this for Kubernetes `livenessProbe` so a temporarily-down PHP-FPM does not cause the pod to be restarted.
+
+### `GET /readyz` — readiness
+
+Sends a FastCGI request to PHP-FPM's built-in status handler (`pm.status_path`) and returns:
+
+- `200 OK` / body `ready` — PHP-FPM answered with a 2xx.
+- `503 Service Unavailable` / body `not ready` — upstream unreachable, timed out, or returned a non-2xx.
+
+Use this for Kubernetes `readinessProbe` so traffic is paused when the upstream is down without killing the pod.
+
+Behavior notes:
+
+- **One automatic retry** with a short backoff. The FastCGI client already retries once on a stale pooled socket; `/readyz` adds a second top-level retry so a PHP-FPM restart blip does not flap readiness.
+- **Dedicated FastCGI client** with the configured `readiness.timeout` as its dial/read/write deadline, so probes stay bounded even when the main request timeouts are generous.
+- **Upstream body is never echoed** — the status page reply is discarded so the endpoint cannot leak worker-pool internals.
+- **Auth / CORS / locations are bypassed** — probes are meant for load balancers, not browsers.
+- **Disable with `readiness.enabled: false`** — `/readyz` then mirrors `/healthz` and always returns 200.
+
+**PHP-FPM side configuration required:** add `pm.status_path = /status` (or your chosen path) to your PHP-FPM pool config. Match the path to `readiness.status_path`.
+
+```ini
+; /usr/local/etc/php-fpm.d/www.conf
+pm.status_path = /status
+```
 
 ## Performance
 

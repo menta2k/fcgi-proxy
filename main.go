@@ -102,6 +102,7 @@ func main() {
 		StaticLocations: staticLocations,
 		CORS:            parsed.CORS,
 		Auth:            parsed.Auth,
+		Readiness:       parsed.Readiness,
 		Pool: fcgi.PoolConfig{
 			MaxIdle:     parsed.PoolMaxIdle,
 			IdleTimeout: parsed.PoolIdleTimeout,

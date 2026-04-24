@@ -64,6 +64,15 @@ config:
   pool_max_idle: 32
   pool_idle_timeout: "30s"
 
+  # Readiness probe drives /readyz by sending a FastCGI request to PHP-FPM's
+  # built-in status path (pm.status_path). Enable pm.status_path in your
+  # PHP-FPM pool config (typically /status) for this to work.
+  # /healthz stays as a dependency-free liveness check.
+  readiness:
+    enabled: true
+    status_path: "/status"
+    timeout: "1s"
+
   # Headers injected on every proxied response.
   response_headers:
     X-Content-Type-Options: nosniff

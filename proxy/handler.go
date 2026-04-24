@@ -50,9 +50,12 @@ type Config struct {
 	// CORS handling is a no-op.
 	CORS config.ParsedCORS
 	// Auth configures HTTP authentication applied before the FCGI dispatch.
-	// Bypasses /healthz, static locations, and cached upstream locations
-	// (they serve before the auth check runs).
+	// Bypasses /healthz, /readyz, static locations, and cached upstream
+	// locations (they serve before the auth check runs).
 	Auth config.ParsedAuth
+	// Readiness configures the /readyz endpoint that probes PHP-FPM's
+	// status page. When Enabled is false, /readyz behaves like /healthz.
+	Readiness config.ParsedReadiness
 }
 
 // StaticResponse is a materialized inline response served for a configured
@@ -123,6 +126,10 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 		pwCache = newPasswordCache(cfg.Auth.PasswordCacheTTL, cfg.Auth.PasswordCacheMaxEntries)
 	}
 
+	// Readiness probe client is constructed once per Handler call and
+	// reused across every /readyz request. Nil when readiness is disabled.
+	prober := newReadinessProber(cfg)
+
 	cleanDocRoot := filepath.Clean(cfg.DocumentRoot)
 
 	return func(ctx *fasthttp.RequestCtx) {
@@ -135,13 +142,25 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 
 		uriPath := string(ctx.URI().Path())
 
-		// Health check endpoint — responds without touching the upstream.
+		// Liveness endpoint — responds without touching the upstream. Answers
+		// only "is the proxy process alive?"; dependency on PHP-FPM is
+		// intentionally not checked here so a temporarily-down upstream
+		// doesn't cause Kubernetes to kill the pod.
 		// Intentionally skips response_headers injection (health checks go to
 		// load balancers, not browsers — security headers are not needed here).
 		if uriPath == "/healthz" {
 			ctx.SetStatusCode(fasthttp.StatusOK)
 			ctx.SetContentType("text/plain")
 			ctx.SetBodyString("ok")
+			applyCORSResponseHeaders(ctx, cfg.CORS, corsResult)
+			return
+		}
+
+		// Readiness endpoint — probes the PHP-FPM status page to confirm
+		// the upstream is accepting requests. Failure returns 503 so k8s
+		// stops routing traffic without restarting the pod.
+		if uriPath == "/readyz" {
+			handleReadiness(ctx, prober)
 			applyCORSResponseHeaders(ctx, cfg.CORS, corsResult)
 			return
 		}

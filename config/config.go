@@ -29,6 +29,16 @@ type Config struct {
 	Locations       []LocationConfig  `json:"locations"`
 	CORS            CORSConfig        `json:"cors"`
 	Auth            AuthConfig        `json:"auth"`
+	Readiness       ReadinessConfig   `json:"readiness"`
+}
+
+// ReadinessConfig configures the /readyz endpoint, which probes PHP-FPM's
+// built-in status path to verify the upstream is accepting requests. When
+// Enabled is false, /readyz mirrors /healthz and always returns 200.
+type ReadinessConfig struct {
+	Enabled    bool   `json:"enabled"`
+	StatusPath string `json:"status_path"` // PHP-FPM's pm.status_path, default "/status"
+	Timeout    string `json:"timeout"`     // per-probe deadline, default "1s"
 }
 
 // CORSConfig defines Cross-Origin Resource Sharing rules.
@@ -96,6 +106,14 @@ type Parsed struct {
 	Locations       []ParsedLocation
 	CORS            ParsedCORS
 	Auth            ParsedAuth
+	Readiness       ParsedReadiness
+}
+
+// ParsedReadiness holds validated readiness probe settings.
+type ParsedReadiness struct {
+	Enabled    bool
+	StatusPath string
+	Timeout    time.Duration
 }
 
 // ParsedCORS holds validated CORS settings with pre-built header values.
@@ -145,6 +163,11 @@ func DefaultConfig() Config {
 		MaxConcurrency:  1024,
 		PoolMaxIdle:     32,
 		PoolIdleTimeout: "30s",
+		Readiness: ReadinessConfig{
+			Enabled:    true,
+			StatusPath: "/status",
+			Timeout:    "1s",
+		},
 	}
 }
 
@@ -298,6 +321,11 @@ func Parse(cfg Config) (Parsed, error) {
 		return Parsed{}, err
 	}
 
+	parsedReadiness, err := parseReadiness(cfg.Readiness)
+	if err != nil {
+		return Parsed{}, err
+	}
+
 	// Prevent silent conflict between the generic response_headers injector and
 	// the CORS middleware. When both are configured, the middleware overwrites
 	// any overlapping Access-Control-* header from response_headers, which
@@ -327,6 +355,43 @@ func Parse(cfg Config) (Parsed, error) {
 		Locations:       parsedLocations,
 		CORS:            parsedCORS,
 		Auth:            parsedAuth,
+		Readiness:       parsedReadiness,
+	}, nil
+}
+
+// parseReadiness validates the readiness section and applies defaults.
+func parseReadiness(cfg ReadinessConfig) (ParsedReadiness, error) {
+	if !cfg.Enabled {
+		return ParsedReadiness{Enabled: false}, nil
+	}
+
+	statusPath := cfg.StatusPath
+	if statusPath == "" {
+		statusPath = "/status"
+	}
+	if statusPath[0] != '/' {
+		return ParsedReadiness{}, fmt.Errorf("config: readiness.status_path must start with /, got %q", statusPath)
+	}
+	if strings.ContainsAny(statusPath, "\r\n\x00") {
+		return ParsedReadiness{}, fmt.Errorf("config: readiness.status_path contains invalid characters (CR, LF, or null)")
+	}
+
+	timeoutStr := cfg.Timeout
+	if timeoutStr == "" {
+		timeoutStr = "1s"
+	}
+	timeout, err := time.ParseDuration(timeoutStr)
+	if err != nil {
+		return ParsedReadiness{}, fmt.Errorf("config: invalid readiness.timeout %q: %w", timeoutStr, err)
+	}
+	if timeout < 100*time.Millisecond || timeout > 30*time.Second {
+		return ParsedReadiness{}, fmt.Errorf("config: readiness.timeout must be between 100ms and 30s, got %v", timeout)
+	}
+
+	return ParsedReadiness{
+		Enabled:    true,
+		StatusPath: statusPath,
+		Timeout:    timeout,
 	}, nil
 }
 
