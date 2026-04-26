@@ -3,7 +3,6 @@ package proxy
 import (
 	"bytes"
 	"fmt"
-	"log"
 	"net"
 	"path"
 	"path/filepath"
@@ -14,6 +13,7 @@ import (
 	"github.com/menta2k/fcgi-proxy/config"
 	"github.com/menta2k/fcgi-proxy/fcgi"
 	"github.com/menta2k/fcgi-proxy/proxy/locationcache"
+	"github.com/rs/zerolog/log"
 	"github.com/valyala/fasthttp"
 )
 
@@ -267,13 +267,16 @@ func Handler(cfg Config) fasthttp.RequestHandler {
 
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Printf("fcgi upstream error: %v", err)
+			log.Error().Err(err).Str("path", uriPath).Msg("fcgi upstream error")
 			ctx.Error("Bad Gateway", fasthttp.StatusBadGateway)
 			return
 		}
 
 		if len(resp.Stderr) > 0 {
-			log.Printf("fcgi stderr: %s", truncate(resp.Stderr, 4096))
+			// PHP-FPM writes notices, warnings, and uncaught exception traces
+			// to stderr. Treat as WARN — most are recoverable in PHP-land
+			// (E_NOTICE/E_WARNING) and should not page on-call.
+			log.Warn().Bytes("stderr", truncate(resp.Stderr, 4096)).Str("path", uriPath).Msg("fcgi stderr")
 		}
 
 		ctx.SetStatusCode(resp.StatusCode)
@@ -590,13 +593,13 @@ func serveStatic(ctx *fasthttp.RequestCtx, resp StaticResponse, responseHeaders 
 func serveLocationCache(ctx *fasthttp.RequestCtx, cache *locationcache.Cache, loc locationcache.Location, responseHeaders map[string]string) {
 	entry, err := cache.Get(loc)
 	if err != nil {
-		log.Printf("location cache error for %s: %v", loc.Path, err)
+		log.Error().Err(err).Str("path", loc.Path).Msg("location cache fetch failed")
 		ctx.Error("Bad Gateway", fasthttp.StatusBadGateway)
 		return
 	}
 
 	if entry.StatusCode != 200 {
-		log.Printf("location cache: upstream %s returned %d", loc.Path, entry.StatusCode)
+		log.Error().Str("path", loc.Path).Int("status", entry.StatusCode).Msg("location cache: bad upstream status")
 		ctx.Error("Bad Gateway", fasthttp.StatusBadGateway)
 		return
 	}

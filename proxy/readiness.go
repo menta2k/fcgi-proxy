@@ -3,10 +3,10 @@ package proxy
 import (
 	"errors"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/menta2k/fcgi-proxy/fcgi"
+	"github.com/rs/zerolog/log"
 	"github.com/valyala/fasthttp"
 )
 
@@ -147,7 +147,10 @@ func handleReadiness(ctx *fasthttp.RequestCtx, prober *readinessProber, drain *d
 	}
 
 	if err := prober.probe(); err != nil {
-		log.Printf("readiness probe failed: %v", truncateErr(err, 200))
+		// WARN, not ERROR: a transient PHP-FPM blip is expected and
+		// already covered by the retry. Failed probes flap k8s readiness
+		// without page-worthy operator action.
+		log.Warn().Err(truncateErr(err, 200)).Msg("readiness probe failed")
 		ctx.SetStatusCode(fasthttp.StatusServiceUnavailable)
 		ctx.SetBodyString("not ready")
 		return

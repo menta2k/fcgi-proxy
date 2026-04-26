@@ -2,7 +2,6 @@ package main
 
 import (
 	"flag"
-	"log"
 	"net"
 	"net/http"
 	_ "net/http/pprof" // registers /debug/pprof/* on http.DefaultServeMux
@@ -16,10 +15,14 @@ import (
 	"github.com/menta2k/fcgi-proxy/fcgi"
 	"github.com/menta2k/fcgi-proxy/proxy"
 	"github.com/menta2k/fcgi-proxy/proxy/locationcache"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/valyala/fasthttp"
 )
 
 func main() {
+	setupLogger()
+
 	configPath := flag.String("config", "config.json", "path to configuration file")
 	listen := flag.String("listen", "", "listen address (overrides config)")
 	network := flag.String("network", "", "fcgi network: tcp or unix (overrides config)")
@@ -42,7 +45,7 @@ func main() {
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		log.Fatal().Err(err).Str("path", *configPath).Msg("failed to load config")
 	}
 
 	if *listen != "" {
@@ -60,7 +63,7 @@ func main() {
 
 	parsed, err := config.Parse(cfg)
 	if err != nil {
-		log.Fatalf("Invalid config: %v", err)
+		log.Fatal().Err(err).Msg("invalid config")
 	}
 
 	listenPort := derivePort(parsed.Listen)
@@ -116,12 +119,17 @@ func main() {
 		Concurrency:        parsed.MaxConcurrency,
 		ReadTimeout:        parsed.ReadTimeout,
 		WriteTimeout:       parsed.WriteTimeout,
+		Logger:             fasthttpLogAdapter{},
 	}
 
 	go func() {
-		log.Printf("Starting fcgi-proxy on %s -> %s://%s", parsed.Listen, parsed.Network, parsed.Address)
+		log.Info().
+			Str("listen", parsed.Listen).
+			Str("network", parsed.Network).
+			Str("address", parsed.Address).
+			Msg("starting fcgi-proxy")
 		if err := server.ListenAndServe(parsed.Listen); err != nil {
-			log.Fatalf("Server error: %v", err)
+			log.Fatal().Err(err).Msg("server error")
 		}
 	}()
 
@@ -129,10 +137,42 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 
-	log.Println("Shutting down...")
+	log.Info().Msg("shutting down")
 	if err := server.Shutdown(); err != nil {
-		log.Printf("Shutdown error: %v", err)
+		log.Error().Err(err).Msg("shutdown error")
 	}
+}
+
+// setupLogger configures zerolog to emit JSON shaped for Google Cloud Logging.
+// The agent on GKE auto-parses jsonPayload fields, so renaming `level` to
+// `severity` (with uppercase values) and `time` to `timestamp` makes log
+// records show up with proper severity in Logs Explorer instead of every
+// line being tagged ERROR because it was on stderr.
+func setupLogger() {
+	zerolog.TimestampFieldName = "timestamp"
+	zerolog.LevelFieldName = "severity"
+	zerolog.MessageFieldName = "message"
+	zerolog.ErrorFieldName = "error"
+	zerolog.TimeFieldFormat = time.RFC3339Nano
+	zerolog.LevelTraceValue = "DEBUG"
+	zerolog.LevelDebugValue = "DEBUG"
+	zerolog.LevelInfoValue = "INFO"
+	zerolog.LevelWarnValue = "WARNING"
+	zerolog.LevelErrorValue = "ERROR"
+	zerolog.LevelFatalValue = "CRITICAL"
+	zerolog.LevelPanicValue = "ALERT"
+	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
+}
+
+// fasthttpLogAdapter routes fasthttp's internal Printf calls into zerolog so
+// server-level errors (e.g. timeouts, malformed requests) carry the same
+// severity tagging as application logs. fasthttp logs are nearly all error
+// or warning class, so mapping them to ERROR is safe — the alternative
+// (stdlib log on stderr) loses severity entirely under GCP.
+type fasthttpLogAdapter struct{}
+
+func (fasthttpLogAdapter) Printf(format string, args ...any) {
+	log.Error().Msgf(format, args...)
 }
 
 // startPprof brings up the Go runtime profiler on a dedicated HTTP server.
@@ -146,9 +186,9 @@ func startPprof(addr string) {
 		WriteTimeout: 60 * time.Second,
 	}
 	go func() {
-		log.Printf("pprof listening on %s (http://%s/debug/pprof/)", addr, addr)
+		log.Info().Str("addr", addr).Msg("pprof listening")
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("pprof server error: %v", err)
+			log.Error().Err(err).Msg("pprof server error")
 		}
 	}()
 }
@@ -158,7 +198,7 @@ func startPprof(addr string) {
 func derivePort(listen string) string {
 	_, port, err := net.SplitHostPort(listen)
 	if err != nil {
-		log.Printf("Warning: could not parse listen port from %q, defaulting to 80", listen)
+		log.Warn().Str("listen", listen).Msg("could not parse listen port, defaulting to 80")
 		return "80"
 	}
 	return port
